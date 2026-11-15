@@ -1,0 +1,10 @@
+[package]
+name = "tray"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ghostperf-tray"
+path = "src/main.rs"
+
+[dependencies]

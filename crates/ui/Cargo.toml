@@ -1,0 +1,10 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ghostperf-ui"
+path = "src/main.rs"
+
+[dependencies]

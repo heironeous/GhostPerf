@@ -13,13 +13,13 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 
 ### IPC
 
-- Tray ↔ Agent: local named pipe (`\\.\pipe\perfmon-agent`), simple text/JSON commands (`start`, `stop`, `status`).
+- Tray ↔ Agent: loopback-only TCP socket (`127.0.0.1:47631`), one newline-terminated text command per connection (`start [label]`, `stop`, `status`, `shutdown`). Chosen over a named pipe for implementation simplicity — identical code on Windows/Linux, no extra crate, still same-machine-only.
 - Tray → UI: spawn UI process directly (UI reads SQLite DB directly, read-only — no need to proxy through the agent).
 
 ### Data model (SQLite)
 
 - `sessions(id, started_at, ended_at, label, host_info)`
-- `metrics(session_id, ts, cpu_pct, mem_used_mb, mem_committed_mb, disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps, top_processes_json, ...)`
+- `metrics(session_id, ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb, disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps, top_processes_json)`
 - Index on `(session_id, ts)` for fast per-session range queries.
 - WAL mode + batched inserts (buffer N samples, flush periodically) to keep write overhead low.
 
@@ -28,19 +28,21 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 ## Features
 
 ### Phase 1 — Agent core
-- [ ] Rust project scaffold for agent (`agent/`)
-- [ ] SQLite schema + migrations (`sessions`, `metrics` tables)
-- [ ] Batched/buffered writer so disk I/O doesn't happen on every sample
-- [ ] Sampling loop: CPU % (total + per-core)
-- [ ] Sampling loop: memory (working set, committed, available)
-- [ ] Sampling loop: disk I/O (read/write bytes/sec, queue length)
-- [ ] Sampling loop: network I/O (rx/tx bytes/sec per adapter)
-- [ ] Per-process top-N snapshot (CPU/mem hogs) each sample
-- [ ] Configurable sample interval (default e.g. 1s, adjustable)
-- [ ] Session lifecycle: `start_session()` / `stop_session()` writes session row with timestamps
-- [ ] Graceful shutdown on stop command (flush buffer, close session)
-- [ ] Named-pipe server for control commands (`start`, `stop`, `status`)
-- [ ] Config file (sample interval, DB path, retention policy)
+- [x] Rust project scaffold for agent (`agent/`) — part of a Cargo workspace with `crates/storage`, `crates/tray`, `crates/ui`
+- [x] SQLite schema + migrations (`sessions`, `metrics` tables) — `crates/storage`
+- [x] Batched/buffered writer so disk I/O doesn't happen on every sample — size- and time-based flush (`crates/agent/src/core.rs`)
+- [x] Sampling loop: CPU % (total + per-core)
+- [x] Sampling loop: memory (used, available)
+- [x] Sampling loop: disk I/O (read/write bytes/sec, summed across processes) — note: queue length not available via `sysinfo`; skipped for now
+- [x] Sampling loop: network I/O (rx/tx bytes/sec, summed across adapters)
+- [x] Per-process top-N snapshot (CPU/mem hogs) each sample
+- [x] Configurable sample interval (default 1s, via config file)
+- [x] Session lifecycle: `start_session()` / `stop_session()` writes session row with timestamps
+- [x] Graceful shutdown on stop/shutdown command (flush buffer, close session) — also recovers orphaned sessions left open by an unclean shutdown on next startup
+- [x] Control server for `start`/`stop`/`status`/`shutdown` commands — TCP loopback, see IPC note above (not a named pipe)
+- [x] Config file (sample interval, flush thresholds, DB path, control port, retention policy) — TOML, auto-created with defaults on first run
+
+Smoke-tested end-to-end on Linux (dev environment): started a session over the control channel, confirmed real CPU/mem/disk/net/per-process samples were written to SQLite, stopped the session, verified clean shutdown.
 
 ### Phase 2 — Intermittent-issue detection
 - [ ] High-resolution stall/hang detector (measure scheduler latency via a dedicated timing thread)

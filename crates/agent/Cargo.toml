@@ -1,0 +1,15 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ghostperf-agent"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+sysinfo = "0.31"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
