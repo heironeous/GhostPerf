@@ -3,9 +3,10 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use storage::{MetricSample, Store};
+use storage::{MetricSample, NewEvent, Store};
 
 use crate::config::AgentConfig;
+use crate::eventlog;
 use crate::now_millis;
 
 pub enum CoreMsg {
@@ -20,6 +21,14 @@ pub enum CoreMsg {
         reply: Sender<StatusSnapshot>,
     },
     Sample(MetricSample),
+    /// A stall, threshold spike, or (eventually) a correlated OS event —
+    /// anything timestamped that isn't a regular metric sample.
+    Event {
+        ts: i64,
+        kind: String,
+        value: f64,
+        detail: Option<String>,
+    },
     Shutdown,
 }
 
@@ -41,6 +50,7 @@ pub fn run(
     recording_flag: Arc<AtomicBool>,
 ) {
     let mut buffer: Vec<MetricSample> = Vec::with_capacity(config.flush_batch_size);
+    let mut events_buffer: Vec<NewEvent> = Vec::new();
     let mut current_session: Option<(i64, i64)> = None; // (id, started_at)
     let flush_interval = Duration::from_millis(config.flush_interval_ms);
     // The time-based flush is tracked against a deadline rather than relying on
@@ -69,11 +79,17 @@ pub fn run(
                 let _ = reply.send(result);
             }
             Ok(CoreMsg::Stop { reply }) => {
-                let result = if let Some((id, _)) = current_session.take() {
+                let result = if let Some((id, started_at)) = current_session.take() {
                     recording_flag.store(false, Ordering::SeqCst);
-                    flush(&store, id, &mut buffer);
                     let ended_at = now_millis();
-                    store.stop_session(id, ended_at).map(|_| Some(id)).map_err(Into::into)
+                    if config.eventlog_correlation {
+                        events_buffer.extend(eventlog::correlate(started_at, ended_at));
+                    }
+                    flush(&store, id, &mut buffer, &mut events_buffer);
+                    store
+                        .stop_session(id, ended_at)
+                        .map(|_| Some(id))
+                        .map_err(Into::into)
                 } else {
                     Ok(None)
                 };
@@ -89,17 +105,35 @@ pub fn run(
                 let _ = reply.send(snapshot);
             }
             Ok(CoreMsg::Sample(sample)) => {
-                if let Some((id, _)) = current_session {
+                if current_session.is_some() {
+                    check_thresholds(&sample, &config, &mut events_buffer);
                     buffer.push(sample);
                     if buffer.len() >= config.flush_batch_size {
-                        flush(&store, id, &mut buffer);
+                        if let Some((id, _)) = current_session {
+                            flush(&store, id, &mut buffer, &mut events_buffer);
+                        }
                         last_flush = Instant::now();
                     }
                 }
             }
+            Ok(CoreMsg::Event {
+                ts,
+                kind,
+                value,
+                detail,
+            }) => {
+                if current_session.is_some() {
+                    events_buffer.push(NewEvent {
+                        ts,
+                        kind,
+                        value,
+                        detail,
+                    });
+                }
+            }
             Ok(CoreMsg::Shutdown) => {
                 if let Some((id, _)) = current_session.take() {
-                    flush(&store, id, &mut buffer);
+                    flush(&store, id, &mut buffer, &mut events_buffer);
                     let _ = store.stop_session(id, now_millis());
                 }
                 recording_flag.store(false, Ordering::SeqCst);
@@ -111,21 +145,62 @@ pub fn run(
 
         if last_flush.elapsed() >= flush_interval {
             if let Some((id, _)) = current_session {
-                flush(&store, id, &mut buffer);
+                flush(&store, id, &mut buffer, &mut events_buffer);
             }
             last_flush = Instant::now();
         }
     }
 }
 
-fn flush(store: &Store, session_id: i64, buffer: &mut Vec<MetricSample>) {
-    if buffer.is_empty() {
-        return;
+/// A sample at or above either threshold is recorded as a spike event
+/// alongside the regular metric row, so the UI can flag it on a timeline
+/// without having to re-scan every sample for threshold crossings.
+fn check_thresholds(
+    sample: &MetricSample,
+    config: &AgentConfig,
+    events_buffer: &mut Vec<NewEvent>,
+) {
+    if sample.cpu_pct >= config.cpu_spike_threshold_pct {
+        events_buffer.push(NewEvent {
+            ts: sample.ts,
+            kind: "cpu_spike".to_string(),
+            value: sample.cpu_pct as f64,
+            detail: None,
+        });
     }
-    if let Err(e) = store.insert_metrics_batch(session_id, buffer) {
-        eprintln!("ghostperf-agent: failed to flush metrics batch: {e}");
+
+    let mem_total = sample.mem_used_mb + sample.mem_available_mb;
+    if mem_total > 0.0 {
+        let mem_pct = sample.mem_used_mb / mem_total * 100.0;
+        if mem_pct >= config.mem_spike_threshold_pct {
+            events_buffer.push(NewEvent {
+                ts: sample.ts,
+                kind: "mem_spike".to_string(),
+                value: mem_pct as f64,
+                detail: None,
+            });
+        }
     }
-    buffer.clear();
+}
+
+fn flush(
+    store: &Store,
+    session_id: i64,
+    buffer: &mut Vec<MetricSample>,
+    events_buffer: &mut Vec<NewEvent>,
+) {
+    if !buffer.is_empty() {
+        if let Err(e) = store.insert_metrics_batch(session_id, buffer) {
+            eprintln!("ghostperf-agent: failed to flush metrics batch: {e}");
+        }
+        buffer.clear();
+    }
+    if !events_buffer.is_empty() {
+        if let Err(e) = store.insert_events_batch(session_id, events_buffer) {
+            eprintln!("ghostperf-agent: failed to flush events batch: {e}");
+        }
+        events_buffer.clear();
+    }
 }
 
 fn host_info() -> String {
@@ -148,6 +223,9 @@ mod tests {
             disk_write_bps: 0.0,
             net_rx_bps: 0.0,
             net_tx_bps: 0.0,
+            context_switches_per_sec: 0.0,
+            page_faults_per_sec: 0.0,
+            gpu_pct: None,
             top_processes: Vec::new(),
         }
     }
@@ -191,6 +269,130 @@ mod tests {
 
         tx.send(CoreMsg::Shutdown).unwrap();
         core.join().unwrap();
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+    }
+
+    #[test]
+    fn check_thresholds_flags_cpu_and_mem_spikes() {
+        let config = AgentConfig {
+            cpu_spike_threshold_pct: 90.0,
+            mem_spike_threshold_pct: 80.0,
+            ..AgentConfig::default()
+        };
+
+        let mut below = sample(1);
+        below.cpu_pct = 50.0;
+        below.mem_used_mb = 10.0;
+        below.mem_available_mb = 90.0; // 10% used
+        let mut events = Vec::new();
+        check_thresholds(&below, &config, &mut events);
+        assert!(events.is_empty());
+
+        let mut above = sample(2);
+        above.cpu_pct = 95.0;
+        above.mem_used_mb = 85.0;
+        above.mem_available_mb = 15.0; // 85% used
+        let mut events = Vec::new();
+        check_thresholds(&above, &config, &mut events);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e.kind == "cpu_spike"));
+        assert!(events.iter().any(|e| e.kind == "mem_spike"));
+    }
+
+    /// End-to-end through the core thread: a spiking sample should produce
+    /// both a metrics row and an events row for the same session.
+    #[test]
+    fn spiking_sample_persists_an_event_alongside_the_metric() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-core-spike-test-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ));
+        let store = Store::open(&db_path).unwrap();
+        let config = AgentConfig {
+            flush_batch_size: 1, // flush immediately so the test doesn't need to wait
+            cpu_spike_threshold_pct: 90.0,
+            ..AgentConfig::default()
+        };
+
+        let (tx, rx) = channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let core = std::thread::spawn(move || run(store, rx, config, flag));
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Start { label: None, reply }).unwrap();
+        let session_id = reply_rx.recv().unwrap().unwrap();
+
+        let mut spike = sample(1);
+        spike.cpu_pct = 99.0;
+        tx.send(CoreMsg::Sample(spike)).unwrap();
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Stop { reply }).unwrap();
+        reply_rx.recv().unwrap().unwrap();
+
+        tx.send(CoreMsg::Shutdown).unwrap();
+        core.join().unwrap();
+
+        let reader = Store::open(&db_path).unwrap();
+        let metrics = reader.metrics_for_session(session_id).unwrap();
+        let events = reader.events_for_session(session_id).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "cpu_spike");
+
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+    }
+
+    #[test]
+    fn explicit_core_event_is_buffered_and_flushed() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-core-event-test-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ));
+        let store = Store::open(&db_path).unwrap();
+        let config = AgentConfig {
+            flush_batch_size: 1,
+            ..AgentConfig::default()
+        };
+
+        let (tx, rx) = channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let core = std::thread::spawn(move || run(store, rx, config, flag));
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Start { label: None, reply }).unwrap();
+        let session_id = reply_rx.recv().unwrap().unwrap();
+
+        tx.send(CoreMsg::Event {
+            ts: 123,
+            kind: "stall".into(),
+            value: 77.0,
+            detail: Some("x".into()),
+        })
+        .unwrap();
+        // Events alone don't trigger the size-based flush (only samples do),
+        // so stop the session, which flushes unconditionally.
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Stop { reply }).unwrap();
+        reply_rx.recv().unwrap().unwrap();
+
+        tx.send(CoreMsg::Shutdown).unwrap();
+        core.join().unwrap();
+
+        let reader = Store::open(&db_path).unwrap();
+        let events = reader.events_for_session(session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "stall");
+        assert_eq!(events[0].value, 77.0);
+
         drop(reader);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));

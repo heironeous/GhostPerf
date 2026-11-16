@@ -53,12 +53,27 @@ Smoke-tested on Windows 11: release build, agent started, session started over t
 - [x] **Time-based flush never fired while recording.** The flush relied on `recv_timeout(flush_interval)`, which only times out after a full interval with no messages, but samples arrive every second. Data reached disk only in 30-sample batches, so a crash could lose up to ~29 s. The flush is now deadline-based and checked after every message (`crates/agent/src/core.rs`). Regression test: `core::tests::time_based_flush_fires_while_samples_keep_arriving`.
 
 ### Phase 2 — Intermittent-issue detection
-- [ ] High-resolution stall/hang detector (measure scheduler latency via a dedicated timing thread)
-- [ ] Threshold-based spike flagging (e.g. CPU > X%, mem > Y%) written as annotated events alongside metrics
-- [ ] GPU usage sampling (via PDH/`D3DKMT` counters) — optional, if available
-- [ ] Page fault / context-switch counters
-- [ ] Handle count / thread count per process (leak detection)
-- [ ] Event log correlation (surface relevant Windows Event Log entries during a session window)
+- [x] `events` table (`crates/storage`): `(id, session_id, ts, kind, value, detail)`, indexed on `(session_id, ts)` — annotations live alongside `metrics`, not mixed into it
+- [x] High-resolution stall/hang detector — dedicated thread (`crates/agent/src/stall.rs`) sleeps for `stall_check_interval_ms` (default 15ms) and records a `stall` event when it wakes up more than `stall_threshold_ms` (default 50ms) late
+- [x] Threshold-based spike flagging — `cpu_spike_threshold_pct` / `mem_spike_threshold_pct` (default 90%) checked against every sample in `core::run`, written as `cpu_spike`/`mem_spike` events
+- [x] GPU usage sampling via PDH (`\GPU Engine(*)\Utilization Percentage`, summed across engine instances and clamped to 100%) — optional: `None` if the counter set isn't present (older Windows, GPU-less VM)
+- [x] Page fault / context-switch counters — system-wide rates (`MetricSample::page_faults_per_sec`/`context_switches_per_sec`) via PDH (`\Memory\Page Faults/sec`, `\System\Context Switches/sec`)
+- [x] Handle count / thread count per process — `ProcessSample::handle_count`/`thread_count`, filled in only for the top-N processes (after truncation) to avoid a syscall per process per tick; thread counts come from one `CreateToolhelp32Snapshot` per tick, handle counts from `GetProcessHandleCount`
+- [x] Event log correlation — on session stop, queries the System + Application channels via the WinEvt API for Level 1-3 (Critical/Error/Warning) entries within `[started_at, ended_at]` and stores them as `eventlog_critical`/`eventlog_error`/`eventlog_warning` events (`crates/agent/src/eventlog/`)
+
+All of the above work on Linux too, via a second backend (`crates/agent/src/platform/linux_impl.rs`, `crates/agent/src/eventlog/generic_impl.rs`) that exists purely so the agent builds and is smoke-testable in this (non-Windows) dev container — not a shipping target. On Linux, GPU is always `None` and handle_count is approximated with the open-fd count (a different metric, same plumbing); event log correlation is a no-op (nothing to correlate against).
+
+Tested so far: full unit-test suite (incl. new `events` CRUD, schema migration of a pre-Phase-2 DB, stall detector, threshold flagging, and pure-function tests for the Windows Event Log XML/XPath-timestamp parsing) passes on Linux; a real recording session was smoke-tested end-to-end on Linux confirming non-zero context-switch/page-fault rates and populated handle/thread counts land in SQLite. The Windows-only code (`platform::windows_impl`, `eventlog::windows_impl`) is unverified by an actual Windows run — only compile-checked (`cargo check --target x86_64-pc-windows-gnu`, since no MSVC `lib.exe` is available in this container to check the `msvc` triple). Needs the same first-real-run shakeout Phase 1 got.
+
+#### Fixes from first Windows run of Phase 2 (2026-11-16)
+Built (MSVC, debug + release via `build.ps1 -Test`) and smoke-tested on Windows 11: recorded sessions over the control channel in an isolated `%APPDATA%`, confirmed PDH context-switch/page-fault/GPU rates, per-process handle/thread counts, and stall events all land in SQLite; clean `shutdown` with exit code 0. That run found these issues, now fixed:
+
+- [x] **Agent refused to start with an existing Phase 1 `agent.toml`.** The new Phase 2 fields had no serde defaults, so a config written by the older agent failed with `missing field 'stall_check_interval_ms'`. `AgentConfig` now has `#[serde(default)]`, so missing fields fall back to defaults (`crates/agent/src/config.rs`). Regression test: `config::tests::config_from_older_version_missing_new_fields_still_loads`.
+- [x] **Event log correlation silently returned nothing.** `EvtRender` emits single-quoted XML attributes (`<TimeCreated SystemTime='…'/>`), but `extract_attr` only matched double quotes (as did the Linux-written test fixtures), so every event was dropped at the timestamp parse. Now accepts either quote style, and requires a leading space so `Name=` can't match inside `EventSourceName=` (`crates/agent/src/eventlog/format.rs`). Regression tests use verbatim Windows output. Verified against `Get-WinEvent` for the same window (7/7 events, matching levels/providers/IDs) via the ignored machine-dependent test `eventlog::windows_impl::tests::correlate_reads_real_event_log` (run with `-- --ignored`, window via `GP_EVT_START_MS`/`GP_EVT_END_MS`/`GP_EVT_EXPECTED`).
+- [x] **First sample after agent start had `context_switches_per_sec = 0`, `page_faults_per_sec = 0`, `gpu_pct = None`.** PDH rate counters need two collections; the query is now primed once in `PlatformCounters::new()` (`crates/agent/src/platform/windows_impl.rs`).
+- [ ] **First sample of a session after an idle gap reports PDH rates averaged over the whole gap**, since the query is only collected while recording. Minor; fix by collecting on session start (or each tick) if it matters.
+
+Observed: `thread::sleep` wakeup jitter on Windows 11 maxed at ~0.7 ms over 220 wakeups, so the 50 ms default `stall_threshold_ms` has plenty of headroom.
 
 ### Phase 3 — Tray
 - [ ] Rust project scaffold for tray (`tray/`)

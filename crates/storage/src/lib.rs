@@ -27,6 +27,14 @@ pub struct ProcessSample {
     pub name: String,
     pub cpu_pct: f32,
     pub mem_mb: f32,
+    /// Windows HANDLE count (leak detection). `None` where unavailable (e.g.
+    /// not sampled this tick, or unsupported on the platform). On the Linux
+    /// dev build this is approximated with the open-fd count, which is not
+    /// the same metric but exercises the same plumbing.
+    #[serde(default)]
+    pub handle_count: Option<u32>,
+    #[serde(default)]
+    pub thread_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +48,35 @@ pub struct MetricSample {
     pub disk_write_bps: f64,
     pub net_rx_bps: f64,
     pub net_tx_bps: f64,
+    #[serde(default)]
+    pub context_switches_per_sec: f64,
+    #[serde(default)]
+    pub page_faults_per_sec: f64,
+    /// `None` when no GPU counter is available on this machine.
+    #[serde(default)]
+    pub gpu_pct: Option<f32>,
     pub top_processes: Vec<ProcessSample>,
+}
+
+/// A point-in-time annotation alongside a session's metrics: a detected
+/// stall, a threshold spike, or a correlated OS event-log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub session_id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub value: f64,
+    pub detail: Option<String>,
+}
+
+/// Event data not yet assigned an id, for batched inserts.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    pub ts: i64,
+    pub kind: String,
+    pub value: f64,
+    pub detail: Option<String>,
 }
 
 /// Owns the SQLite connection. Not `Sync` — callers that need the store from
@@ -87,12 +123,58 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_metrics_session_ts
                 ON metrics(session_id, ts);
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  INTEGER NOT NULL REFERENCES sessions(id),
+                ts          INTEGER NOT NULL,
+                kind        TEXT NOT NULL,
+                value       REAL NOT NULL,
+                detail      TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_session_ts
+                ON events(session_id, ts);
             "#,
         )?;
+
+        // `metrics` predates these columns; add them in place for existing
+        // DBs rather than requiring a fresh file (sqlite can't add multiple
+        // columns in one ALTER TABLE statement, so these run individually
+        // and are each guarded by a column-existence check for idempotency).
+        self.ensure_column(
+            "metrics",
+            "context_switches_per_sec",
+            "REAL NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column("metrics", "page_faults_per_sec", "REAL NOT NULL DEFAULT 0")?;
+        self.ensure_column("metrics", "gpu_pct", "REAL")?;
+
         Ok(())
     }
 
-    pub fn start_session(&self, started_at: i64, label: Option<&str>, host_info: Option<&str>) -> Result<i64> {
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == column);
+        if !exists {
+            self.conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn start_session(
+        &self,
+        started_at: i64,
+        label: Option<&str>,
+        host_info: Option<&str>,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO sessions (started_at, label, host_info) VALUES (?1, ?2, ?3)",
             params![started_at, label, host_info],
@@ -125,8 +207,9 @@ impl Store {
             let mut stmt = tx.prepare(
                 "INSERT INTO metrics (
                     session_id, ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb,
-                    disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps, top_processes_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps,
+                    context_switches_per_sec, page_faults_per_sec, gpu_pct, top_processes_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for s in samples {
                 let cpu_per_core_json = serde_json::to_string(&s.cpu_per_core_pct)?;
@@ -142,12 +225,47 @@ impl Store {
                     s.disk_write_bps,
                     s.net_rx_bps,
                     s.net_tx_bps,
+                    s.context_switches_per_sec,
+                    s.page_faults_per_sec,
+                    s.gpu_pct,
                     top_json,
                 ])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn insert_events_batch(&self, session_id: i64, events: &[NewEvent]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO events (session_id, ts, kind, value, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in events {
+                stmt.execute(params![session_id, e.ts, e.kind, e.value, e.detail])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn events_for_session(&self, session_id: i64) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, ts, kind, value, detail FROM events WHERE session_id = ?1 ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                ts: row.get(2)?,
+                kind: row.get(3)?,
+                value: row.get(4)?,
+                detail: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -163,7 +281,8 @@ impl Store {
                 host_info: row.get(4)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn get_session(&self, session_id: i64) -> Result<Option<Session>> {
@@ -188,12 +307,13 @@ impl Store {
     pub fn metrics_for_session(&self, session_id: i64) -> Result<Vec<MetricSample>> {
         let mut stmt = self.conn.prepare(
             "SELECT ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb, disk_read_bps,
-                    disk_write_bps, net_rx_bps, net_tx_bps, top_processes_json
+                    disk_write_bps, net_rx_bps, net_tx_bps, context_switches_per_sec,
+                    page_faults_per_sec, gpu_pct, top_processes_json
              FROM metrics WHERE session_id = ?1 ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             let cpu_per_core_json: String = row.get(2)?;
-            let top_json: String = row.get(9)?;
+            let top_json: String = row.get(12)?;
             Ok((
                 MetricSample {
                     ts: row.get(0)?,
@@ -205,6 +325,9 @@ impl Store {
                     disk_write_bps: row.get(6)?,
                     net_rx_bps: row.get(7)?,
                     net_tx_bps: row.get(8)?,
+                    context_switches_per_sec: row.get(9)?,
+                    page_faults_per_sec: row.get(10)?,
+                    gpu_pct: row.get(11)?,
                     top_processes: Vec::new(),
                 },
                 cpu_per_core_json,
@@ -223,8 +346,16 @@ impl Store {
     }
 
     pub fn delete_session(&self, session_id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM metrics WHERE session_id = ?1", params![session_id])?;
-        self.conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        self.conn.execute(
+            "DELETE FROM metrics WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         Ok(())
     }
 }
@@ -236,7 +367,9 @@ mod tests {
     #[test]
     fn start_stop_and_roundtrip_metrics() {
         let store = Store::open(":memory:").unwrap();
-        let id = store.start_session(1000, Some("test"), Some("host")).unwrap();
+        let id = store
+            .start_session(1000, Some("test"), Some("host"))
+            .unwrap();
 
         let sample = MetricSample {
             ts: 1001,
@@ -248,11 +381,16 @@ mod tests {
             disk_write_bps: 50.0,
             net_rx_bps: 10.0,
             net_tx_bps: 5.0,
+            context_switches_per_sec: 2500.0,
+            page_faults_per_sec: 75.0,
+            gpu_pct: Some(33.0),
             top_processes: vec![ProcessSample {
                 pid: 42,
                 name: "example.exe".into(),
                 cpu_pct: 9.0,
                 mem_mb: 128.0,
+                handle_count: Some(200),
+                thread_count: Some(12),
             }],
         };
         store.insert_metrics_batch(id, &[sample]).unwrap();
@@ -265,5 +403,99 @@ mod tests {
         let metrics = store.metrics_for_session(id).unwrap();
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].top_processes[0].name, "example.exe");
+        assert_eq!(metrics[0].top_processes[0].handle_count, Some(200));
+        assert_eq!(metrics[0].context_switches_per_sec, 2500.0);
+        assert_eq!(metrics[0].gpu_pct, Some(33.0));
+    }
+
+    #[test]
+    fn events_roundtrip() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(1000, None, None).unwrap();
+
+        store
+            .insert_events_batch(
+                id,
+                &[
+                    NewEvent {
+                        ts: 1010,
+                        kind: "stall".into(),
+                        value: 120.0,
+                        detail: None,
+                    },
+                    NewEvent {
+                        ts: 1020,
+                        kind: "cpu_spike".into(),
+                        value: 97.5,
+                        detail: Some("exceeded 90%".into()),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let events = store.events_for_session(id).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "stall");
+        assert_eq!(events[1].detail.as_deref(), Some("exceeded 90%"));
+    }
+
+    #[test]
+    fn migrate_adds_missing_columns_to_existing_metrics_table() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-storage-migrate-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        {
+            // Simulate a pre-Phase-2 DB: only the original columns exist.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL,
+                    ended_at INTEGER, label TEXT, host_info TEXT
+                );
+                CREATE TABLE metrics (
+                    session_id INTEGER NOT NULL, ts INTEGER NOT NULL, cpu_pct REAL NOT NULL,
+                    cpu_per_core_json TEXT NOT NULL, mem_used_mb REAL NOT NULL,
+                    mem_available_mb REAL NOT NULL, disk_read_bps REAL NOT NULL,
+                    disk_write_bps REAL NOT NULL, net_rx_bps REAL NOT NULL,
+                    net_tx_bps REAL NOT NULL, top_processes_json TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        // Opening via `Store::open` should migrate the old table in place.
+        let store = Store::open(&db_path).unwrap();
+        let id = store.start_session(1, None, None).unwrap();
+        let sample = MetricSample {
+            ts: 2,
+            cpu_pct: 1.0,
+            cpu_per_core_pct: vec![1.0],
+            mem_used_mb: 1.0,
+            mem_available_mb: 1.0,
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
+            context_switches_per_sec: 9.0,
+            page_faults_per_sec: 3.0,
+            gpu_pct: None,
+            top_processes: Vec::new(),
+        };
+        store.insert_metrics_batch(id, &[sample]).unwrap();
+        let metrics = store.metrics_for_session(id).unwrap();
+        assert_eq!(metrics[0].context_switches_per_sec, 9.0);
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
     }
 }

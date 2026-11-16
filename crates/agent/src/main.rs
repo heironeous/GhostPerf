@@ -1,7 +1,10 @@
 mod config;
 mod core;
+mod eventlog;
 mod ipc;
+mod platform;
 mod sampler;
+mod stall;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -80,6 +83,14 @@ fn main() -> anyhow::Result<()> {
     {
         let core_tx = core_tx.clone();
         std::thread::spawn(move || ipc::serve(listener, core_tx));
+    }
+
+    {
+        let core_tx = core_tx.clone();
+        let recording_flag = recording_flag.clone();
+        let check_interval = Duration::from_millis(config.stall_check_interval_ms);
+        let threshold = Duration::from_millis(config.stall_threshold_ms);
+        std::thread::spawn(move || stall::run(core_tx, recording_flag, check_interval, threshold));
     }
 
     // The control thread owns the shutdown path: once `core::run` returns

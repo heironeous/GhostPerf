@@ -80,8 +80,12 @@ fn dispatch(line: &str, core_tx: &Sender<CoreMsg>) -> String {
                 Ok(s) => format!(
                     "OK recording={} session_id={} started_at={} buffered={}",
                     s.recording,
-                    s.session_id.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                    s.started_at.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    s.session_id
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    s.started_at
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".into()),
                     s.samples_buffered
                 ),
                 Err(_) => "ERR no reply from agent core".to_string(),
