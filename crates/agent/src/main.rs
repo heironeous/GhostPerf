@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use config::AgentConfig;
 use storage::Store;
 
@@ -19,13 +20,27 @@ pub fn now_millis() -> i64 {
 }
 
 fn main() -> anyhow::Result<()> {
-    let config = AgentConfig::load_or_default(AgentConfig::default_config_path())?;
+    let config_path = AgentConfig::default_config_path();
+    let config = AgentConfig::load_or_default(&config_path)?;
     println!(
         "ghostperf-agent: db={} control_port={} sample_interval_ms={}",
         config.db_path.display(),
         config.control_port,
         config.sample_interval_ms
     );
+
+    // Bind the control socket before anything else and fail hard if it's
+    // unavailable: without it the agent can't be started or stopped, and
+    // previously it would keep running silently in that useless state.
+    let listener = ipc::bind(config.control_port).with_context(|| {
+        format!(
+            "failed to bind control port 127.0.0.1:{} — another agent may already be running, \
+             or the port is reserved by Windows (check `netsh int ipv4 show excludedportrange \
+             protocol=tcp`). Change `control_port` in {}",
+            config.control_port,
+            config_path.display()
+        )
+    })?;
 
     let store = Store::open(&config.db_path)?;
     let closed = store.close_orphaned_sessions(now_millis())?;
@@ -63,13 +78,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     {
-        let port = config.control_port;
         let core_tx = core_tx.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = ipc::serve(port, core_tx) {
-                eprintln!("ghostperf-agent: ipc server stopped: {e}");
-            }
-        });
+        std::thread::spawn(move || ipc::serve(listener, core_tx));
     }
 
     // The control thread owns the shutdown path: once `core::run` returns

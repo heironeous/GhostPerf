@@ -4,12 +4,18 @@ use std::sync::mpsc::{channel, Sender};
 
 use crate::core::CoreMsg;
 
+/// Binds the loopback-only control socket. Kept separate from `serve` so the
+/// caller can bind on the main thread and treat failure as fatal — an agent
+/// with no control channel can never be told to start recording.
+pub fn bind(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", port))
+}
+
 /// Loopback-only control server. Accepts one newline-terminated command per
 /// connection (`start [label]`, `stop`, `status`, `shutdown`) and replies
 /// with a single line before closing. Binding to 127.0.0.1 keeps it off the
 /// network entirely — this is a same-machine control channel, not a remote API.
-pub fn serve(port: u16, core_tx: Sender<CoreMsg>) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -23,7 +29,6 @@ pub fn serve(port: u16, core_tx: Sender<CoreMsg>) -> anyhow::Result<()> {
             Err(e) => eprintln!("ghostperf-agent: ipc accept error: {e}"),
         }
     }
-    Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, core_tx: Sender<CoreMsg>) -> anyhow::Result<()> {

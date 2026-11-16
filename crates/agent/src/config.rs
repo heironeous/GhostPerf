@@ -27,7 +27,11 @@ impl Default for AgentConfig {
             flush_interval_ms: 10_000,
             top_n_processes: 5,
             db_path: default_db_path(),
-            control_port: 47631,
+            // Kept below 44620: on some Windows machines (WSL/Hyper-V/VPN
+            // drivers) a block of loopback ports from 44620 to 48715 is held
+            // without appearing in `excludedportrange`, and the old default
+            // 47631 fell inside it.
+            control_port: 38631,
             retention_days: 30,
         }
     }

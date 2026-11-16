@@ -13,7 +13,7 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 
 ### IPC
 
-- Tray ↔ Agent: loopback-only TCP socket (`127.0.0.1:47631`), one newline-terminated text command per connection (`start [label]`, `stop`, `status`, `shutdown`). Chosen over a named pipe for implementation simplicity — identical code on Windows/Linux, no extra crate, still same-machine-only.
+- Tray ↔ Agent: loopback-only TCP socket (`127.0.0.1:38631`, configurable via `control_port`), one newline-terminated text command per connection (`start [label]`, `stop`, `status`, `shutdown`). Chosen over a named pipe for implementation simplicity — identical code on Windows/Linux, no extra crate, still same-machine-only.
 - Tray → UI: spawn UI process directly (UI reads SQLite DB directly, read-only — no need to proxy through the agent).
 
 ### Data model (SQLite)
@@ -30,7 +30,7 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 ### Phase 1 — Agent core
 - [x] Rust project scaffold for agent (`agent/`) — part of a Cargo workspace with `crates/storage`, `crates/tray`, `crates/ui`
 - [x] SQLite schema + migrations (`sessions`, `metrics` tables) — `crates/storage`
-- [x] Batched/buffered writer so disk I/O doesn't happen on every sample — size- and time-based flush (`crates/agent/src/core.rs`)
+- [x] Batched/buffered writer so disk I/O doesn't happen on every sample — size- and time-based flush (`crates/agent/src/core.rs`); time-based flush fixed, see below
 - [x] Sampling loop: CPU % (total + per-core)
 - [x] Sampling loop: memory (used, available)
 - [x] Sampling loop: disk I/O (read/write bytes/sec, summed across processes) — note: queue length not available via `sysinfo`; skipped for now
@@ -43,6 +43,14 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 - [x] Config file (sample interval, flush thresholds, DB path, control port, retention policy) — TOML, auto-created with defaults on first run
 
 Smoke-tested end-to-end on Linux (dev environment): started a session over the control channel, confirmed real CPU/mem/disk/net/per-process samples were written to SQLite, stopped the session, verified clean shutdown.
+
+#### Fixes from first Windows run (2026-11-16)
+Smoke-tested on Windows 11: release build, agent started, session started over the control channel, real samples confirmed in SQLite. That run found these issues, now fixed:
+
+- [x] **`build.ps1` passed `--release` to cargo one character at a time.** The `if` expression returned a one-element array, which PowerShell unrolled to a plain string, and splatting a string passes it character by character (`error: unexpected argument '-' found`). Fixed by wrapping the result in `@()`.
+- [x] **Default control port was unusable on some Windows machines.** Loopback ports 44620–48715 (a 4,096-port block) were held by a hidden system component, not listed in `netsh int ipv4 show excludedportrange`, and the old default `47631` fell inside it. Default moved to `38631` (`crates/agent/src/config.rs`). Note: an existing `%APPDATA%\GhostPerf\agent.toml` overrides the default and must be edited by hand.
+- [x] **Agent kept running silently when the control port couldn't be bound.** The bind happened inside the IPC thread, which only logged to stderr and exited, leaving an agent that could never be told to start recording. The socket is now bound on the main thread before startup, and failure exits with code 1 and a message naming the port and config file (`crates/agent/src/main.rs`, `crates/agent/src/ipc.rs`).
+- [x] **Time-based flush never fired while recording.** The flush relied on `recv_timeout(flush_interval)`, which only times out after a full interval with no messages, but samples arrive every second. Data reached disk only in 30-sample batches, so a crash could lose up to ~29 s. The flush is now deadline-based and checked after every message (`crates/agent/src/core.rs`). Regression test: `core::tests::time_based_flush_fires_while_samples_keep_arriving`.
 
 ### Phase 2 — Intermittent-issue detection
 - [ ] High-resolution stall/hang detector (measure scheduler latency via a dedicated timing thread)
