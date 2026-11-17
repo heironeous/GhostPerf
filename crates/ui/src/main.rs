@@ -6,6 +6,7 @@ mod app;
 mod data;
 mod export;
 mod format;
+mod icon;
 mod process_agg;
 mod views;
 
@@ -24,13 +25,18 @@ fn main() -> eframe::Result {
     let db_path = config.db_path.clone();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 820.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1150.0, 820.0])
+            .with_icon(icon::viewport_icon()),
         ..Default::default()
     };
 
     eframe::run_native(
         "GhostPerf",
         options,
-        Box::new(move |_cc| Ok(Box::new(app::GhostPerfApp::new(db_path)))),
+        Box::new(move |cc| {
+            icon::apply(cc);
+            Ok(Box::new(app::GhostPerfApp::new(db_path)))
+        }),
     )
 }

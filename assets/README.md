@@ -24,6 +24,7 @@ Palette: backgrounds are tray `#2B3070` → `#13152E`, agent `#4A5263` → `#151
 
 **Where they're used:**
 - Each binary crate's `build.rs` builds its `.ico` into the exe on Windows using the `winresource` build dependency. It also sets the name Explorer and Task Manager show ("GhostPerf Agent", "GhostPerf Tray", "GhostPerf").
+- The UI's window icons (title bar, taskbar, Alt-Tab) come from the same `ghostperf-ui.ico` embedded in its exe. `crates/ui/src/icon.rs` loads resource 1 at the system's small and big icon sizes for the window's DPI and sets them with `WM_SETICON`, so the title bar gets the hand-tuned small frames. If that fails, or on non-Windows builds, it uses `icon/png/ghostperf-ui-256.png`, which is compiled into the binary. Without this, eframe shows its own default egui icon.
 - The tray exe also contains `ghostperf-recording.ico` as resource ID 2. At runtime, `crates/tray/src/icons.rs` loads resource 1 or 2 at the system's small-icon size. If that fails, or on non-Windows builds, it decodes `icon/png/ghostperf[-recording]-32.png`, which is compiled into the binary.
 
 After regenerating the icons, rebuild. The `build.rs` scripts rerun automatically when an `.ico` file changes.

@@ -4529,9 +4529,11 @@ dependencies = [
  "egui_plot",
  "log",
  "logging",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "storage",
+ "windows 0.62.2",
  "winresource",
 ]
 

@@ -139,13 +139,21 @@ fn run() -> anyhow::Result<()> {
         let menu_event = match event {
             Event::UserEvent(TickEvent::Menu(event)) => Some(event),
             Event::UserEvent(TickEvent::Poll) => {
-                match supervisor::ensure_agent_running(&mut sys) {
-                    Ok(true) => log::warn!("agent wasn't running, relaunched it"),
-                    Ok(false) => {}
-                    Err(e) => log::error!("failed to relaunch agent: {e:#}"),
+                let status = agent_port().and_then(ipc_client::is_recording);
+                // A `status` reply proves the agent is alive, so the process
+                // scan (enumerating every process on the system, the bulk of
+                // the tray's idle CPU when it ran every second) only runs when
+                // the agent doesn't answer: not started yet, still binding its
+                // port, crashed, or hung (found running, so not relaunched).
+                if status.is_none() {
+                    match supervisor::ensure_agent_running(&mut sys) {
+                        Ok(true) => log::warn!("agent wasn't running, relaunched it"),
+                        Ok(false) => {}
+                        Err(e) => log::error!("failed to relaunch agent: {e:#}"),
+                    }
                 }
 
-                if let Some(now_recording) = agent_port().and_then(ipc_client::is_recording) {
+                if let Some(now_recording) = status {
                     if now_recording != recording {
                         recording = now_recording;
                         start_item.set_enabled(!recording);

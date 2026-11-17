@@ -29,6 +29,16 @@ impl Sampler {
         }
     }
 
+    /// Resets every rate baseline to now and discards the result: sysinfo's
+    /// CPU, per-process CPU and disk deltas, network byte deltas, PDH rate
+    /// counters, and `last_tick`. Called when recording starts (see
+    /// `sampling_loop`), because nothing refreshes these while idle, so
+    /// without it a session's first sample averages over the whole idle gap
+    /// since the previous session's last sample.
+    pub fn prime(&mut self) {
+        let _ = self.sample(0);
+    }
+
     /// Take one sample. Call this on a fixed interval; the very first call
     /// after construction may report 0 for rate-based fields since there is
     /// no prior tick to diff against.

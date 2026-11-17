@@ -22,7 +22,7 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 const AGENT_PROCESS_NAME: &str = "ghostperf-agent";
 
 pub fn is_agent_running(sys: &mut System) -> bool {
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    refresh_process_names(sys);
     sys.processes().values().any(|p| {
         // A zombie is a dead process whose exit status its parent hasn't
         // collected yet — on Linux dev machines that's common enough (a
@@ -30,6 +30,18 @@ pub fn is_agent_running(sys: &mut System) -> bool {
         // make this permanently think a crashed agent is still up.
         p.status() != ProcessStatus::Zombie && is_process_named(p.name(), AGENT_PROCESS_NAME)
     })
+}
+
+/// Refreshes the process list with names only. `refresh_processes` also
+/// gathers CPU, memory, disk usage and exe path for every process on the
+/// system, none of which a "does a process with this name exist" check
+/// needs. `ProcessesToUpdate::All` still drops processes that have exited,
+/// so a dead agent doesn't linger in the list.
+pub fn refresh_process_names(sys: &mut System) {
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        sysinfo::ProcessRefreshKind::new(),
+    );
 }
 
 fn spawn_agent() -> anyhow::Result<()> {

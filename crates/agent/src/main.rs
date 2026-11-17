@@ -9,9 +9,10 @@ mod instance;
 mod ipc;
 mod platform;
 mod sampler;
+mod sampling_loop;
 mod stall;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -106,16 +107,17 @@ fn run() -> anyhow::Result<()> {
         let core_tx = core_tx.clone();
         std::thread::spawn(move || {
             let mut sampler = sampler::Sampler::new(top_n);
-            loop {
-                std::thread::sleep(sample_interval);
-                if !recording_flag.load(Ordering::SeqCst) {
-                    continue;
+            sampling_loop::run(sample_interval, &recording_flag, |step| match step {
+                sampling_loop::Step::Prime => {
+                    sampler.prime();
+                    true
                 }
-                let sample = sampler.sample(now_millis());
-                if core_tx.send(core::CoreMsg::Sample(sample)).is_err() {
-                    break; // core thread shut down
+                sampling_loop::Step::Sample => {
+                    let sample = sampler.sample(now_millis());
+                    // Err: the core thread has shut down, so stop sampling.
+                    core_tx.send(core::CoreMsg::Sample(sample)).is_ok()
                 }
-            }
+            });
         });
     }
 
