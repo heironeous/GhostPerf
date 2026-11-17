@@ -4,7 +4,7 @@ A lightweight Windows performance monitor built to catch *intermittent* problems
 
 The shipping target is Windows. It's developed partly in a Linux container (no Windows machine on hand during initial development), so Windows-only code has both a real implementation and a Linux stand-in used purely to keep the build and test suite running during development — see `AGENTS.md` for how that split works and how to verify Windows-only code without a Windows machine.
 
-**Status:** Phases 1–4 (agent core, intermittent-issue detection, tray, session-viewer UI) are implemented and at least smoke-tested. Full roadmap, what's verified vs. not, and per-phase implementation notes live in [`TODO.md`](TODO.md) — read it before picking up work here.
+**Status:** Phases 1–5 (agent core, intermittent-issue detection, tray, session-viewer UI, packaging & polish) are implemented and at least smoke-tested. Full roadmap, what's verified vs. not, and per-phase implementation notes live in [`TODO.md`](TODO.md) — read it before picking up work here.
 
 ## Layout
 
@@ -44,6 +44,16 @@ cargo test --workspace
 
 On Linux, building `crates/tray` (and, via the same underlying X11/Wayland/GTK packages, `crates/ui`) needs some system packages first — see `AGENTS.md` for the exact install command. `crates/agent`, `crates/agent_config`, and `crates/storage` have no such requirement. Actually *running* `crates/ui` additionally needs a working GPU adapter — on Linux without a real GPU, install `mesa-vulkan-drivers` for a software one (see `AGENTS.md`).
 
+## Packaging
+
+```powershell
+./build.ps1 -Package
+```
+
+Produces, in `dist\`:
+- `GhostPerf-portable-<version>.zip` — the three exes plus an empty `data` folder. Unzip anywhere and run `ghostperf-tray.exe`; that folder's presence (not a flag) is what makes config/database/logs live next to the exe instead of `%APPDATA%\GhostPerf` — no installer, no registry entries, no autostart. Delete the `data` folder to switch that copy back to installed-style behavior.
+- `GhostPerf-Setup-<version>.exe` — an NSIS installer (`installer/ghostperf.nsi`), only if [NSIS](https://nsis.sourceforge.io/) (`makensis`) is on `PATH`; skipped with a warning otherwise. Installs per-user under `%LocalAppData%\Programs\GhostPerf` (no admin prompt), adds Start Menu shortcuts, registers autostart (the same `HKCU\...\Run` entry the tray's own "Start with Windows" checkbox manages, so either one can toggle it off), and ships an uninstaller that removes all of that but leaves `%APPDATA%\GhostPerf` (your recordings) alone.
+
 ## Running
 
 1. Start `ghostperf-tray` (the agent doesn't need to be started separately — the tray launches it if it isn't already running, and relaunches it if it crashes).
@@ -52,7 +62,7 @@ On Linux, building `crates/tray` (and, via the same underlying X11/Wayland/GTK p
 
 Neither binary opens a window or console on Windows (the tray is just the tray icon). Their output goes to `%APPDATA%\GhostPerf\logs\agent.log` and `tray.log`: startup, the control port, session start/stop, relaunches, and any errors or panics. Each file is rotated to `.log.1` once it passes 5 MiB. Check these logs first when something doesn't behave.
 
-Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does). The SQLite database defaults to `%APPDATA%\GhostPerf\ghostperf.db`. On non-Windows dev builds, both (and the `logs` directory) default under the OS temp dir instead, since `%APPDATA%` doesn't exist.
+Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does), unless a `data` folder exists next to the running exe, in which case everything below lives there instead (portable mode — see Packaging). The SQLite database defaults to `%APPDATA%\GhostPerf\ghostperf.db`. On non-Windows dev builds, both (and the `logs` directory) default under the OS temp dir instead, since `%APPDATA%` doesn't exist. Completed sessions older than `retention_days` (and, if `retention_max_db_mb` is set, the oldest ones beyond that size too) are auto-pruned after every recording and when the agent starts; a session still recording is never pruned.
 
 The agent also exposes a plain-text control protocol on a loopback TCP port: one newline-terminated command per connection (`start [label]`, `stop`, `status`, `shutdown`), one line of reply. The port isn't configurable: the OS assigns a free one each time the agent starts, and the agent writes it to `agent.port` next to `agent.toml` (deleted again on clean shutdown). This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
 
@@ -69,7 +79,7 @@ Launch `ghostperf-ui` directly, or click "Open UI" in the tray menu. It reads th
 
 - **Sessions** lists every recorded session with its date, duration, label, and quick stats (avg/peak CPU, peak memory, event count). Rename in place or delete (two-step confirm) from here, or click **Open** for the detail view.
 - **Session detail** charts CPU/mem/disk/net over the session, with stall/spike/Event-Log markers overlaid. Left-drag pans a chart, right-drag box-zooms it (all 4 stay in sync); drag on the thin strip below them to select a time range, which filters the per-process table underneath. Per-process CPU is normalized to whole-machine scale there (the raw per-core value `sysinfo` reports can exceed 100% per process — see TODO.md's Phase 1 note on this). Export the session to CSV or JSON from the bottom of this view.
-- **Settings** edits `agent.toml` (sample interval, retention, spike thresholds, Event Log correlation) and shows the DB location. Takes effect the next time the agent starts.
+- **Settings** edits `agent.toml` (sample interval, retention days, an optional max database size, spike thresholds, Event Log correlation) and shows the DB location. Takes effect the next time the agent starts.
 
 ## Testing
 

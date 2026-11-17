@@ -5,16 +5,27 @@ use agent_config::AgentConfig;
 pub struct SettingsView {
     config_path: PathBuf,
     config: AgentConfig,
+    /// `AgentConfig::retention_max_db_mb` split into a checkbox and a
+    /// value, so disabling it doesn't lose the number the user had typed
+    /// (re-enabling restores it instead of resetting to the default).
+    max_db_cap_enabled: bool,
+    max_db_cap_mb: u64,
     status: Option<String>,
 }
+
+const DEFAULT_MAX_DB_CAP_MB: u64 = 500;
 
 impl SettingsView {
     pub fn load() -> Self {
         let config_path = AgentConfig::default_config_path();
         let config = AgentConfig::load_or_default(&config_path).unwrap_or_default();
+        let max_db_cap_enabled = config.retention_max_db_mb.is_some();
+        let max_db_cap_mb = config.retention_max_db_mb.unwrap_or(DEFAULT_MAX_DB_CAP_MB);
         Self {
             config_path,
             config,
+            max_db_cap_enabled,
+            max_db_cap_mb,
             status: None,
         }
     }
@@ -43,6 +54,18 @@ impl SettingsView {
                 ui.add(egui::DragValue::new(&mut self.config.retention_days).range(1..=3650));
                 ui.end_row();
 
+                ui.label("Max database size");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.max_db_cap_enabled, "cap at");
+                    ui.add_enabled(
+                        self.max_db_cap_enabled,
+                        egui::DragValue::new(&mut self.max_db_cap_mb)
+                            .range(10..=1_000_000)
+                            .suffix(" MB"),
+                    );
+                });
+                ui.end_row();
+
                 ui.label("CPU spike threshold (%)");
                 ui.add(
                     egui::DragValue::new(&mut self.config.cpu_spike_threshold_pct)
@@ -68,6 +91,7 @@ impl SettingsView {
 
         ui.separator();
         if ui.button("Save").clicked() {
+            self.config.retention_max_db_mb = self.max_db_cap_enabled.then_some(self.max_db_cap_mb);
             self.status = Some(match self.config.save(&self.config_path) {
                 Ok(()) => "Saved. Restart the agent for changes to take effect.".to_string(),
                 Err(e) => format!("Save failed: {e:#}"),

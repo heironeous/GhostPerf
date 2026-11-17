@@ -11,13 +11,36 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Directory holding `agent.toml`, the default database, and the agent's
-/// runtime files (`agent.port`, `agent.lock`). `%APPDATA%` doesn't exist on
-/// non-Windows dev builds, so those fall back to the OS temp dir.
+/// runtime files (`agent.port`, `agent.lock`).
+///
+/// Portable mode (Phase 5) takes priority: if a `data` folder already
+/// exists next to the running executable, everything lives there instead
+/// of `%APPDATA%\GhostPerf` — no `--portable` flag and no separate
+/// portable build, since all three binaries make this same check. A
+/// portable `.zip` distribution ships with that empty `data` folder
+/// alongside the exes; an installed copy doesn't have one, so it falls
+/// through to `%APPDATA%`. `%APPDATA%` itself doesn't exist on non-Windows
+/// dev builds, so that path falls back to the OS temp dir.
 pub fn data_dir() -> PathBuf {
+    if let Some(portable) = portable_data_dir() {
+        return portable;
+    }
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("GhostPerf")
+}
+
+fn portable_data_dir() -> Option<PathBuf> {
+    portable_data_dir_in(&std::env::current_exe().ok()?)
+}
+
+/// Pure half of [`portable_data_dir`], taking the executable path as an
+/// argument instead of calling [`std::env::current_exe`] itself, so it's
+/// testable without actually controlling what that returns.
+fn portable_data_dir_in(exe_path: &Path) -> Option<PathBuf> {
+    let dir = exe_path.parent()?.join("data");
+    dir.is_dir().then_some(dir)
 }
 
 /// Where each binary writes its log file (`agent.log`, `tray.log`, …): the
@@ -47,6 +70,12 @@ pub struct AgentConfig {
     pub db_path: PathBuf,
     /// How many days of completed sessions to retain before auto-pruning.
     pub retention_days: u32,
+    /// If set, the database is additionally capped at this size: when over
+    /// it, the oldest completed sessions are deleted (regardless of
+    /// `retention_days`) until it's back under the cap. `None` (the
+    /// default) means no size cap, only the age-based rule above.
+    #[serde(default)]
+    pub retention_max_db_mb: Option<u64>,
     /// How often the stall detector's timing thread wakes up and measures
     /// how late it is. Shorter intervals catch shorter stalls but cost more
     /// (harmless) wakeups.
@@ -74,6 +103,7 @@ impl Default for AgentConfig {
             top_n_processes: 5,
             db_path: data_dir().join("ghostperf.db"),
             retention_days: 30,
+            retention_max_db_mb: None,
             stall_check_interval_ms: 15,
             stall_threshold_ms: 50,
             cpu_spike_threshold_pct: 90.0,
@@ -154,6 +184,48 @@ retention_days = 30
         let old = "sample_interval_ms = 750\ncontrol_port = 38631\n";
         let cfg: AgentConfig = toml::from_str(old).expect("stale control_port should be ignored");
         assert_eq!(cfg.sample_interval_ms, 750);
+    }
+
+    #[test]
+    fn config_missing_retention_max_db_mb_defaults_to_unlimited() {
+        let old = "sample_interval_ms = 500\n";
+        let cfg: AgentConfig = toml::from_str(old).unwrap();
+        assert_eq!(cfg.retention_max_db_mb, None);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ghostperf-agent-config-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn portable_data_dir_is_used_when_a_data_folder_sits_next_to_the_exe() {
+        let dir = scratch_dir("portable-present");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let exe = dir.join("ghostperf-agent.exe");
+        assert_eq!(portable_data_dir_in(&exe), Some(dir.join("data")));
+    }
+
+    #[test]
+    fn no_data_folder_next_to_the_exe_means_not_portable() {
+        let dir = scratch_dir("portable-absent");
+        let exe = dir.join("ghostperf-agent.exe");
+        assert_eq!(portable_data_dir_in(&exe), None);
+    }
+
+    #[test]
+    fn a_file_named_data_does_not_count_as_portable_mode() {
+        // Only a *directory* called `data` is the marker; a stray file with
+        // that name (unlikely, but cheap to guard) must not trigger it.
+        let dir = scratch_dir("portable-file-not-dir");
+        std::fs::write(dir.join("data"), b"not a directory").unwrap();
+        let exe = dir.join("ghostperf-agent.exe");
+        assert_eq!(portable_data_dir_in(&exe), None);
     }
 
     #[test]

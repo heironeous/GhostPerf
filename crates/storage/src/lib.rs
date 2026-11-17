@@ -443,6 +443,88 @@ impl Store {
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         Ok(())
     }
+
+    /// Deletes completed sessions older than `cutoff_ts`, then — if
+    /// `max_db_bytes` is given and the database is still over that size —
+    /// keeps deleting the oldest remaining completed session until it's
+    /// under the cap or none are left. A session still recording
+    /// (`ended_at IS NULL`) is never pruned by either rule, however old or
+    /// however far over a size cap the database is. Returns the number of
+    /// sessions deleted by either rule.
+    pub fn prune(&self, cutoff_ts: i64, max_db_bytes: Option<u64>) -> Result<usize> {
+        let mut deleted = self.prune_older_than(cutoff_ts)?;
+        if let Some(max_bytes) = max_db_bytes {
+            deleted += self.prune_to_max_size(max_bytes)?;
+        }
+        Ok(deleted)
+    }
+
+    pub fn prune_older_than(&self, cutoff_ts: i64) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM metrics WHERE session_id IN \
+             (SELECT id FROM sessions WHERE started_at < ?1 AND ended_at IS NOT NULL)",
+            params![cutoff_ts],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE session_id IN \
+             (SELECT id FROM sessions WHERE started_at < ?1 AND ended_at IS NOT NULL)",
+            params![cutoff_ts],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM sessions WHERE started_at < ?1 AND ended_at IS NOT NULL",
+            params![cutoff_ts],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Deletes the oldest completed sessions, one at a time, until
+    /// [`Self::db_size_bytes`] reports at or under `max_bytes` or there are
+    /// no more completed sessions to delete. `VACUUM`s once at the end if
+    /// anything was deleted, so the file on disk actually shrinks to match
+    /// rather than just freeing pages for SQLite to reuse internally.
+    pub fn prune_to_max_size(&self, max_bytes: u64) -> Result<usize> {
+        let mut deleted = 0usize;
+        while self.db_size_bytes()? > max_bytes {
+            let oldest: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE ended_at IS NOT NULL \
+                     ORDER BY started_at ASC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = oldest else { break };
+            self.delete_session(id)?;
+            deleted += 1;
+        }
+        if deleted > 0 {
+            self.conn.execute_batch("VACUUM")?;
+        }
+        Ok(deleted)
+    }
+
+    /// Approximate on-disk database size: `(total pages − free pages) ×
+    /// page size`, not just `page_count × page_size` — without a `VACUUM`
+    /// (which `prune_to_max_size` only does once it's finished deleting,
+    /// not after every single delete), pages freed by `DELETE` sit on
+    /// SQLite's internal freelist and still count toward `page_count` even
+    /// though they hold no data, which would make size-cap pruning delete
+    /// every session before ever observing a smaller size.
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let freelist_count: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(((page_count - freelist_count).max(0) * page_size) as u64)
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +573,34 @@ mod tests {
         assert_eq!(metrics[0].top_processes[0].handle_count, Some(200));
         assert_eq!(metrics[0].context_switches_per_sec, 2500.0);
         assert_eq!(metrics[0].gpu_pct, Some(33.0));
+    }
+
+    #[test]
+    fn close_orphaned_sessions_closes_only_still_open_ones() {
+        let store = Store::open(":memory:").unwrap();
+        let clean = store.start_session(1000, None, None).unwrap();
+        store.stop_session(clean, 2000).unwrap();
+        // Simulates what a crash/unclean-shutdown leaves behind: a session
+        // row with no `ended_at`, exactly what `Store::open` on the next
+        // agent start must find and close (see crates/agent/src/main.rs).
+        let orphaned = store.start_session(3000, None, None).unwrap();
+
+        let closed = store.close_orphaned_sessions(9999).unwrap();
+        assert_eq!(closed, 1, "only the orphaned session should be touched");
+
+        assert_eq!(
+            store.get_session(clean).unwrap().unwrap().ended_at,
+            Some(2000),
+            "an already-closed session's end time must not be overwritten"
+        );
+        assert_eq!(
+            store.get_session(orphaned).unwrap().unwrap().ended_at,
+            Some(9999)
+        );
+
+        // Idempotent: running it again (e.g. a second restart) with
+        // nothing left open closes nothing.
+        assert_eq!(store.close_orphaned_sessions(99999).unwrap(), 0);
     }
 
     #[test]
@@ -615,6 +725,151 @@ mod tests {
         let id = store.start_session(0, None, None).unwrap();
         store.insert_metrics_batch(id, &[s]).unwrap();
         assert_eq!(store.session_summary(id).unwrap().peak_mem_used_pct, None);
+    }
+
+    fn minimal_sample(ts: i64) -> MetricSample {
+        MetricSample {
+            ts,
+            cpu_pct: 1.0,
+            cpu_per_core_pct: vec![1.0],
+            mem_used_mb: 1.0,
+            mem_available_mb: 1.0,
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
+            context_switches_per_sec: 0.0,
+            page_faults_per_sec: 0.0,
+            gpu_pct: None,
+            top_processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prune_older_than_deletes_old_completed_sessions_but_keeps_recent_and_recording() {
+        let store = Store::open(":memory:").unwrap();
+
+        let old = store.start_session(1_000, None, None).unwrap();
+        store
+            .insert_metrics_batch(old, &[minimal_sample(1_000)])
+            .unwrap();
+        store.stop_session(old, 1_500).unwrap();
+
+        let recent = store.start_session(50_000, None, None).unwrap();
+        store.stop_session(recent, 50_500).unwrap();
+
+        let still_recording = store.start_session(500, None, None).unwrap();
+
+        let deleted = store.prune_older_than(10_000).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining: Vec<i64> = store
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            !remaining.contains(&old),
+            "old completed session should be pruned"
+        );
+        assert!(remaining.contains(&recent), "recent session must survive");
+        assert!(
+            remaining.contains(&still_recording),
+            "a recording session must never be pruned, however old its started_at is"
+        );
+        assert!(
+            store.metrics_for_session(old).unwrap().is_empty(),
+            "pruning a session must also remove its metrics"
+        );
+    }
+
+    #[test]
+    fn prune_to_max_size_deletes_oldest_completed_sessions_first() {
+        let store = Store::open(":memory:").unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let id = store.start_session(i * 1000, None, None).unwrap();
+            let samples: Vec<_> = (0..50).map(|j| minimal_sample(i * 1000 + j)).collect();
+            store.insert_metrics_batch(id, &samples).unwrap();
+            store.stop_session(id, i * 1000 + 999).unwrap();
+            ids.push(id);
+        }
+
+        let before = store.db_size_bytes().unwrap();
+        assert!(before > 0);
+
+        // A cap smaller than the current size must shrink it, by deleting
+        // the oldest sessions (lowest `started_at`) first.
+        let cap = before / 2;
+        let deleted = store.prune_to_max_size(cap).unwrap();
+        assert!(deleted > 0, "some sessions should have been deleted");
+        assert!(store.db_size_bytes().unwrap() <= cap);
+
+        // Oldest-first, not just "some were deleted": no surviving session
+        // may be older than any deleted one. (Not asserting an exact
+        // deleted-count/size-fraction relationship — SQLite pages can hold
+        // rows from more than one session, so freed space per session
+        // isn't perfectly uniform.)
+        let remaining: Vec<i64> = store
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(remaining.len(), ids.len() - deleted);
+        let max_deleted_start = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !remaining.contains(id))
+            .map(|(i, _)| i as i64 * 1000)
+            .max()
+            .unwrap();
+        let min_remaining_start = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| remaining.contains(id))
+            .map(|(i, _)| i as i64 * 1000)
+            .min()
+            .unwrap();
+        assert!(
+            max_deleted_start < min_remaining_start,
+            "every deleted session must be older than every surviving one"
+        );
+    }
+
+    #[test]
+    fn prune_to_max_size_never_deletes_a_recording_session() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(0, None, None).unwrap();
+        let samples: Vec<_> = (0..200).map(minimal_sample).collect();
+        store.insert_metrics_batch(id, &samples).unwrap();
+        // Never stopped: still "recording".
+
+        let deleted = store.prune_to_max_size(1).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(store.get_session(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_combines_age_and_size_rules() {
+        let store = Store::open(":memory:").unwrap();
+        let old = store.start_session(0, None, None).unwrap();
+        store
+            .insert_metrics_batch(old, &[minimal_sample(0)])
+            .unwrap();
+        store.stop_session(old, 100).unwrap();
+
+        let newer = store.start_session(100_000, None, None).unwrap();
+        let samples: Vec<_> = (0..200).map(|i| minimal_sample(100_000 + i)).collect();
+        store.insert_metrics_batch(newer, &samples).unwrap();
+        store.stop_session(newer, 200_000).unwrap();
+
+        let deleted = store.prune(50_000, Some(1)).unwrap();
+        // `old` is pruned by age, `newer` by the size cap (it's the only
+        // one left once `old` is gone, and 1 byte is smaller than anything).
+        assert_eq!(deleted, 2);
+        assert!(store.list_sessions().unwrap().is_empty());
     }
 
     #[test]

@@ -44,6 +44,12 @@ apt-get install -y mesa-vulkan-drivers libxkbcommon-x11-0
 
 Without `mesa-vulkan-drivers`, `eframe::run_native` fails to find an adapter; without `libxkbcommon-x11-0`, it panics on startup (`Library libxkbcommon-x11.so could not be loaded`) — the panic hook logs this to `ui.log` same as any other panic, which is how it was first diagnosed here. Driving/verifying the UI beyond "it launches" (clicking, dragging, typing) additionally needs `xdotool` (input) and `imagemagick`'s `import` (screenshots of the Xvfb window, since there's nothing else to look at it with) — see the next section.
 
+**NSIS, to build (not just syntax-check) the installer** (`installer/ghostperf.nsi`, Phase 5) — `makensis` itself is a native Linux binary, it just produces a Windows-only `.exe`:
+
+```sh
+apt-get install -y nsis
+```
+
 ## Verifying Windows-only code without a Windows machine
 
 This is the single most important workflow in this repo. Don't skip it for anything touching `#[cfg(target_os = "windows")]` code, a `windows_impl.rs`, or a `build.rs` that embeds resources.
@@ -68,6 +74,21 @@ CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc cargo check --target x86_64-pc-w
 This is how the PDH counters (Phase 2), the registry autostart (Phase 3), and the Event Log correlation (Phase 2) were all written and verified — each one got this scratch-crate treatment before being ported into `crates/agent`/`crates/tray`.
 
 **Even after this, "compiles" is not "works."** Every phase's TODO.md entry says explicitly which Windows-only code is still unverified by an actual run, and every phase so far has needed a handful of real fixes on first contact with real Windows (see the "Fixes from first Windows run" sections in `TODO.md`). Expect the same for whatever you add. If you get access to a real Windows machine, build with `./build.ps1 -Test`, actually exercise the feature, and record what broke and what you fixed in TODO.md the same way previous phases did (see "Documentation conventions" below) — that record is what lets the next session (possibly back in a Linux-only container) know what's actually trustworthy.
+
+## Verifying the installer/packaging without a Windows machine
+
+`cargo check --target x86_64-pc-windows-gnu` (above) only proves the code compiles; it doesn't link, and it definitely doesn't produce something `installer/ghostperf.nsi` can embed. Go one step further for Phase 5 work: a real cross-compiled **release** build, which does link, with mingw providing both the C compiler (for `rusqlite`'s bundled SQLite) and the resource compiler (for `winresource`'s icon/version embedding in each `build.rs`):
+
+```sh
+CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc cargo build --workspace --release --target x86_64-pc-windows-gnu
+```
+
+This produces real `target/x86_64-pc-windows-gnu/release/ghostperf-{agent,tray,ui}.exe` — genuine PE executables (confirm with the `MZ`/`PE\0\0` header check, or `objdump -p` for the subsystem/resource directory) that just can't be *run* here. Two things this unlocks:
+
+- **Building the installer for real**, not just checking the `.nsi` syntax: `makensis` needs the exes to exist at compile time (`File` embeds them), so point it at a `target/release/` that actually has them — e.g. `cp target/x86_64-pc-windows-gnu/release/*.exe target/release/` first, matching the layout `build.ps1 -Package` expects on a real Windows build. Then `makensis -DPRODUCT_VERSION=x.y.z installer/ghostperf.nsi` (note: `-D`, not `/D`, on this Linux build of NSIS; both work on Windows) produces a real `GhostPerf-Setup-x.y.z.exe`, checkable the same way as the other exes. This is strictly more verification than a syntax check — a script with a wrong path or a missing file fails here exactly like it would on Windows.
+- **Exercising agent-only features against the real binary** instead of only `cargo test`: copy `ghostperf-agent` somewhere and run it directly (`APPDATA=/tmp/scratch ./ghostperf-agent`) to smoke-test things like portable-mode detection (create a `data` folder next to the copied exe first) or crash recovery (`kill -9` it mid-session, restart, check the log and the DB) against the actual release artifact, not just the logic in isolation.
+
+`build.ps1 -Package` itself can't be run here at all — there's no PowerShell in this container, and installing one isn't something to do without asking (it reaches outside the repo). Review `.ps1` changes carefully by eye instead, the same way `build.ps1` itself was reviewed before its first real Windows run found a real bug in it (see TODO.md Phase 1) — this script already has a scar for exactly the kind of mistake eyeballing can still catch (PowerShell's array-unwrapping-a-single-result gotcha) and likely has others nothing here will reveal.
 
 ## Smoke-testing the tray on headless Linux
 

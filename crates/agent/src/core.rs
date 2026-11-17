@@ -225,7 +225,29 @@ fn finish_session(
         "session {id} stopped after {:.1}s ({correlated} Event Log entries correlated)",
         (ended_at - started_at) as f64 / 1000.0
     );
+    prune_by_retention(store, config);
     Ok(())
+}
+
+/// Runs retention (Phase 5): deletes completed sessions older than
+/// `retention_days`, then, if `retention_max_db_mb` is set and the
+/// database is still over that size, the oldest remaining ones too. Called
+/// after every session ends (here) and once at agent startup
+/// (`crates/agent/src/main.rs`) — the former keeps a long-running agent's
+/// database in check between restarts, the latter catches a config edited
+/// while the agent wasn't running.
+pub(crate) fn prune_by_retention(store: &Store, config: &AgentConfig) {
+    let cutoff = now_millis() - config.retention_days as i64 * 86_400_000;
+    let max_bytes = config.retention_max_db_mb.map(|mb| mb * 1024 * 1024);
+    match store.prune(cutoff, max_bytes) {
+        Ok(0) => {}
+        Ok(n) => log::info!(
+            "pruned {n} session(s) past retention ({} days{})",
+            config.retention_days,
+            max_bytes.map_or_else(String::new, |b| format!(", {} MB cap", b / 1024 / 1024))
+        ),
+        Err(e) => log::warn!("retention prune failed: {e:#}"),
+    }
 }
 
 fn flush(
@@ -314,6 +336,61 @@ mod tests {
 
         tx.send(CoreMsg::Shutdown).unwrap();
         core.join().unwrap();
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+    }
+
+    /// Retention (Phase 5) must actually run as part of ending a session,
+    /// not just exist as a `Store` method nobody calls.
+    #[test]
+    fn stopping_a_session_prunes_old_sessions_past_retention() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-core-retention-test-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ));
+        let ten_days_ms = 10 * 86_400_000;
+        let old_id = {
+            let store = Store::open(&db_path).unwrap();
+            let started = now_millis() - ten_days_ms;
+            let id = store.start_session(started, None, None).unwrap();
+            store.stop_session(id, started + 1000).unwrap();
+            id
+        };
+
+        let store = Store::open(&db_path).unwrap();
+        // Cutoff lands a day ago: well after the 10-day-old session above,
+        // safely before the brand new one this test is about to record.
+        let config = AgentConfig {
+            retention_days: 1,
+            eventlog_correlation: false,
+            ..AgentConfig::default()
+        };
+        let (tx, rx) = channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let core = std::thread::spawn(move || run(store, rx, config, flag));
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Start { label: None, reply }).unwrap();
+        let new_id = reply_rx.recv().unwrap().unwrap();
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Stop { reply }).unwrap();
+        reply_rx.recv().unwrap().unwrap();
+        tx.send(CoreMsg::Shutdown).unwrap();
+        core.join().unwrap();
+
+        let reader = Store::open(&db_path).unwrap();
+        assert!(
+            reader.get_session(old_id).unwrap().is_none(),
+            "10-day-old completed session should have been pruned"
+        );
+        assert!(
+            reader.get_session(new_id).unwrap().is_some(),
+            "the session that was just recorded must survive its own retention check"
+        );
+
         drop(reader);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));

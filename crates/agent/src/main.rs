@@ -90,6 +90,7 @@ fn run() -> anyhow::Result<()> {
     if closed > 0 {
         log::warn!("closed {closed} orphaned session(s) left open by a prior unclean exit");
     }
+    core::prune_by_retention(&store, &config);
 
     let (core_tx, core_rx) = mpsc::channel();
     let recording_flag = Arc::new(AtomicBool::new(false));
