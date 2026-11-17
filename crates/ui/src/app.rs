@@ -84,6 +84,19 @@ impl eframe::App for GhostPerfApp {
             });
         });
 
+        // Export bar for the open session: a bottom panel, like a status bar,
+        // so it stays visible however far the page below is scrolled. It has
+        // to be added before the CentralPanel, which takes the space left
+        // over.
+        if self.db_open_error.is_none() {
+            if let View::Detail(detail) = &mut self.view {
+                egui::Panel::bottom("export_bar").show(ui, |ui| {
+                    ui.add_space(2.0);
+                    detail.export_controls(ui);
+                });
+            }
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.db_open_error {
                 ui.colored_label(

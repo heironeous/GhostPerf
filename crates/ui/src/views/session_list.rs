@@ -58,9 +58,14 @@ impl SessionsView {
             .column(Column::remainder().at_least(120.0)) // label
             .column(Column::auto().at_least(70.0)) // avg cpu
             .column(Column::auto().at_least(70.0)) // peak cpu
-            .column(Column::auto().at_least(90.0)) // peak mem
+            .column(Column::auto().at_least(130.0)) // peak mem: "22848 MB (35%)"
             .column(Column::auto().at_least(60.0)) // events
-            .column(Column::auto().at_least(170.0)) // actions
+            // Actions. Wide enough up front for the widest state (Open,
+            // Rename, Confirm delete, Cancel ≈ 295 pt): sized only for the
+            // normal three buttons, this auto column grew when a row entered
+            // delete-confirm, squeezing the Label column and reflowing the
+            // whole table under the cursor mid-delete.
+            .column(Column::auto().at_least(300.0))
             .header(20.0, |mut header| {
                 for label in [
                     "Started", "Duration", "Label", "Avg CPU", "Peak CPU", "Peak Mem", "Events", "",
@@ -119,9 +124,12 @@ impl SessionsView {
                         });
                         tr.col(|ui| {
                             ui.label(
-                                row.summary
-                                    .peak_mem_used_mb
-                                    .map_or_else(|| "—".into(), |v| format!("{v:.0} MB")),
+                                match (row.summary.peak_mem_used_mb, row.summary.peak_mem_used_pct)
+                                {
+                                    (Some(mb), Some(pct)) => format!("{mb:.0} MB ({pct:.0}%)"),
+                                    (Some(mb), None) => format!("{mb:.0} MB"),
+                                    (None, _) => "—".into(),
+                                },
                             );
                         });
                         tr.col(|ui| {

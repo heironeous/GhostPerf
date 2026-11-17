@@ -30,6 +30,9 @@ pub struct SessionSummary {
     pub avg_cpu_pct: Option<f64>,
     pub peak_cpu_pct: Option<f64>,
     pub peak_mem_used_mb: Option<f64>,
+    /// Highest memory-in-use percentage over the session, as defined by
+    /// `MetricSample::mem_used_pct`.
+    pub peak_mem_used_pct: Option<f64>,
     /// `(kind, count)`, one row per distinct `events.kind` for the session.
     pub event_counts: Vec<(String, i64)>,
 }
@@ -69,6 +72,26 @@ pub struct MetricSample {
     #[serde(default)]
     pub gpu_pct: Option<f32>,
     pub top_processes: Vec<ProcessSample>,
+}
+
+impl MetricSample {
+    /// Total memory as seen by this sample: used + available. Not stored as
+    /// its own column; this sum is constant across a session in practice
+    /// (65 329 MB on the 64 GB test machine) and is the same total the
+    /// agent's `mem_spike` threshold has always used.
+    pub fn mem_total_mb(&self) -> f32 {
+        self.mem_used_mb + self.mem_available_mb
+    }
+
+    /// Memory in use as a percentage of [`Self::mem_total_mb`]; `None` for a
+    /// sample with no memory figures (total 0) rather than dividing by zero.
+    /// The one definition shared by the agent's `mem_spike` threshold and the
+    /// UI's memory chart, so a spike marker lines up with the curve that
+    /// crosses the threshold. `Store::session_summary`'s SQL mirrors it.
+    pub fn mem_used_pct(&self) -> Option<f32> {
+        let total = self.mem_total_mb();
+        (total > 0.0).then(|| self.mem_used_mb / total * 100.0)
+    }
 }
 
 /// A point-in-time annotation alongside a session's metrics: a detected
@@ -369,18 +392,24 @@ impl Store {
     /// Cheap aggregate stats for a session's list-view row, computed in SQL
     /// so the UI doesn't have to load every sample just to show a summary.
     pub fn session_summary(&self, session_id: i64) -> Result<SessionSummary> {
-        let (sample_count, avg_cpu_pct, peak_cpu_pct, peak_mem_used_mb) = self.conn.query_row(
-            "SELECT COUNT(*), AVG(cpu_pct), MAX(cpu_pct), MAX(mem_used_mb) FROM metrics WHERE session_id = ?1",
-            params![session_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<f64>>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                    row.get::<_, Option<f64>>(3)?,
-                ))
-            },
-        )?;
+        // The percentage mirrors `MetricSample::mem_used_pct`; NULLIF turns a
+        // zero total into NULL (ignored by MAX) instead of a division by zero.
+        let (sample_count, avg_cpu_pct, peak_cpu_pct, peak_mem_used_mb, peak_mem_used_pct) =
+            self.conn.query_row(
+                "SELECT COUNT(*), AVG(cpu_pct), MAX(cpu_pct), MAX(mem_used_mb), \
+                 MAX(mem_used_mb * 100.0 / NULLIF(mem_used_mb + mem_available_mb, 0)) \
+                 FROM metrics WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                    ))
+                },
+            )?;
 
         let mut stmt = self
             .conn
@@ -396,6 +425,7 @@ impl Store {
             avg_cpu_pct,
             peak_cpu_pct,
             peak_mem_used_mb,
+            peak_mem_used_pct,
             event_counts,
         })
     }
@@ -532,6 +562,10 @@ mod tests {
         assert_eq!(summary.avg_cpu_pct, Some(50.0));
         assert_eq!(summary.peak_cpu_pct, Some(90.0));
         assert_eq!(summary.peak_mem_used_mb, Some(300.0));
+        // The SQL percentage must agree with `MetricSample::mem_used_pct`.
+        let expected = sample(1002, 90.0, 300.0).mem_used_pct().unwrap() as f64;
+        let got = summary.peak_mem_used_pct.unwrap();
+        assert!((got - expected).abs() < 1e-3, "{got} vs {expected}");
         let mut counts = summary.event_counts.clone();
         counts.sort();
         assert_eq!(
@@ -549,7 +583,38 @@ mod tests {
         assert_eq!(summary.avg_cpu_pct, None);
         assert_eq!(summary.peak_cpu_pct, None);
         assert_eq!(summary.peak_mem_used_mb, None);
+        assert_eq!(summary.peak_mem_used_pct, None);
         assert!(summary.event_counts.is_empty());
+    }
+
+    #[test]
+    fn mem_used_pct_is_used_over_used_plus_available() {
+        let mut s = MetricSample {
+            ts: 0,
+            cpu_pct: 0.0,
+            cpu_per_core_pct: Vec::new(),
+            mem_used_mb: 16_000.0,
+            mem_available_mb: 48_000.0,
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
+            context_switches_per_sec: 0.0,
+            page_faults_per_sec: 0.0,
+            gpu_pct: None,
+            top_processes: Vec::new(),
+        };
+        assert_eq!(s.mem_total_mb(), 64_000.0);
+        assert_eq!(s.mem_used_pct(), Some(25.0));
+        // No memory figures at all: no percentage, and no division by zero,
+        // in Rust or in the summary SQL.
+        s.mem_used_mb = 0.0;
+        s.mem_available_mb = 0.0;
+        assert_eq!(s.mem_used_pct(), None);
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(0, None, None).unwrap();
+        store.insert_metrics_batch(id, &[s]).unwrap();
+        assert_eq!(store.session_summary(id).unwrap().peak_mem_used_pct, None);
     }
 
     #[test]

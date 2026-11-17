@@ -188,9 +188,7 @@ fn check_thresholds(
         });
     }
 
-    let mem_total = sample.mem_used_mb + sample.mem_available_mb;
-    if mem_total > 0.0 {
-        let mem_pct = sample.mem_used_mb / mem_total * 100.0;
+    if let Some(mem_pct) = sample.mem_used_pct() {
         if mem_pct >= config.mem_spike_threshold_pct {
             events_buffer.push(NewEvent {
                 ts: sample.ts,

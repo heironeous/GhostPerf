@@ -1,6 +1,6 @@
 # Windows Performance Monitor — TODO
 
-**Status at a glance:** Phases 1–4 (agent core, intermittent-issue detection, tray, UI) are implemented — see each phase below for exactly what's verified vs. only compile-checked. Phase 4 has not yet had a real-Windows run (it's only had the same headless-Linux-smoke-test treatment the other phases got before theirs). Phases 5–6 are planned, not started. New to this repo? Read `AGENTS.md` first for how development actually works here (environment setup, how Windows-only code gets verified without a Windows machine, repo conventions) — this file covers *what* to build and *what's already true*, `AGENTS.md` covers *how* to work here.
+**Status at a glance:** Phases 1–4 (agent core, intermittent-issue detection, tray, UI) are implemented — see each phase below for exactly what's verified vs. only compile-checked. Phases 1–4 have each had a real-Windows run (see the "Windows run" subsections), though not every path in each is proven yet. Phases 5–8 are planned, not started. Phase 7 (live session view) and Phase 8 (temperatures and thermal throttling) were added 2026-11-17 and are numbered after the overlay only to keep existing phase references stable, not as a priority order. New to this repo? Read `AGENTS.md` first for how development actually works here (environment setup, how Windows-only code gets verified without a Windows machine, repo conventions) — this file covers *what* to build and *what's already true*, `AGENTS.md` covers *how* to work here.
 
 ## Architecture
 
@@ -153,15 +153,19 @@ Verified working on Windows:
 - **Settings:** saving writes `agent.toml`.
 - **Health:** no WARN, ERROR or panic in `ui.log`. Idle CPU is 0.3% of one core, since egui repaints only on input.
 
-Found, not yet fixed:
-- [ ] **Choosing JSON export overwrites the CSV export.** The CSV/JSON radio only flips `export_as_json`, and the path keeps its default `session-<id>.csv`, so a JSON export is written to `session-<id>.csv`, silently replacing an earlier CSV export (`crates/ui/src/views/session_detail.rs`, `export_controls`). Fix: swap the extension when the format changes, if the path still ends in the other format's extension.
-- [ ] **Export result is shown at the top of the page, far from the Export button.** `self.status` is drawn under the header (`session_detail.rs`, in `ui()`), while Export sits at the bottom, below the process table. The "Exported to …" message is off-screen when you click Export, and inserting it pushes the whole page down ~30 px, so a second click aimed at the CSV/JSON radios lands elsewhere. Fix: show export status in the export row.
-- [ ] **The 4 charts' plot areas aren't horizontally aligned.** Each `egui_plot` sizes its y-axis to its own labels ("100" vs "20000000"), so the same timestamp is drawn at a different x on each chart. Measured: one `cpu_spike` marker at x = 820/831/848/837 px full-range, and 697/725/745/731 px zoomed to 14–22 s, where the "17 s" tick spans 616–668 px. That defeats reading across the charts. Fix: give all 4 plots (and the overview strip) the same `y_axis_min_width`.
-- [ ] **Smaller UI issues:**
-  - Y-axis values are raw bytes/s (`20000000`) rather than scaled KB/MB.
-  - After a box-zoom the CPU chart's y-axis labels disappear.
-  - The overview strip zooms along with the charts because it's in the same link group, so after zooming you can only brush within the zoomed range.
-  - In the session list, a row in delete-confirm state shifts its stat columns ~165 px left of their headers.
+Found on that run. Fixed the same day and re-verified on Windows with the same input-driving method, except for the tray CPU item:
+- [x] **Choosing JSON export overwrote the CSV export.** The CSV/JSON radio only flipped `export_as_json`, and the path kept its default `session-<id>.csv`, so a JSON export was written to `session-<id>.csv`, silently replacing an earlier CSV export. Switching format now swaps a `.csv`/`.json` extension; a user-typed name with any other extension is left alone (`export::path_for_format`, tests `switching_format_*`). Verified: CSV export, switch to JSON (path becomes `session-7.json`), JSON export → both files exist with correct contents.
+- [x] **Export result was shown at the top of the page, far from the Export button.** It went in the page's top status line, which was off-screen at the bottom of a scrolled page, and inserting it pushed everything down ~30 px under the cursor. A first fix put it on a line under the export row, but on Windows that line landed below the visible area. It's now in the export row itself, right of the button: "✔ Saved session-7.csv", with the full path or error on hover, truncated to fit (`export_controls`, new `export_status` field). Verified: message visible on each export, no layout shift.
+- [x] **The 4 charts' plot areas weren't horizontally aligned.** Each `egui_plot` sized its y-axis to its own labels ("100" vs "20000000"), so the same timestamp was drawn at a different x on each chart (one `cpu_spike` marker at x = 697/725/745/731 px zoomed). All charts and the overview now share `Y_AXIS_WIDTH` via `y_axis_min_width`, with tick labels kept short enough to fit (`format_*`, test `axis_labels_stay_short_enough_for_the_shared_axis_width`). Verified: ticks and the marker at identical x on all 5 plots, full-range and zoomed to 14–22 s.
+- [x] **Smaller UI issues:**
+  - Y-axis values were raw bytes/s (`20000000`). Now unit-formatted (`20 MB/s`, `300 KB/s`, `22800 MB`, `100%`; decimal units so round ticks stay round, see `format::format_rate`), hover labels too (`Disk read: 22 MB/s` / `16.0 s`; event markers show name and time only).
+  - The CPU chart's y-axis labels disappeared after box-zoom. The cause wasn't axis width: `egui_plot`'s default powers-of-10 grid only labels marks > 20 pt apart, so at ~15–88% in 140 pt the 10s were too dense and the 100s out of view. Replaced with a 1-2-10-20-… grid (`session_detail::nice_grid_steps`, tests in that module), levels at most 5× apart, so some level is always labelled. Verified: 20/40/60/80% shown zoomed, and every 20% unzoomed (previously only 0/100).
+  - The overview strip zoomed along with the charts (same link group). It's now unlinked, so it always shows the whole session for brush-selecting. Verified: brushed 15–20 s on it while the charts were zoomed to 14–22 s.
+  - In the session list, entering delete-confirm widened the auto-sized Actions column and reflowed the whole table (this entry originally said the row shifted relative to its headers; the screenshot crop only showed one row). The column now starts at 300 pt, wide enough for the confirm state (`session_list.rs`). Verified: columns at identical x in both states.
+- [x] **Flaky tray test, found while landing the above:** `ipc_client::tests::is_recording_parses_{true,false}_from_a_status_reply` failed 2 runs in 8 on Windows. The test stub server did a single `read()`, which could return before the client's `\n` (sent as a separate write by `writeln!`) arrived. It then closed with unread data, which on Windows sends an RST, so the client's read of the reply failed. The stub now reads the whole line, as the real agent does (`crates/tray/src/ipc_client.rs`). 30 of 30 runs pass after the fix. Test-only; the real client/agent exchange wasn't affected.
+- [x] **Memory shown as a percentage of total.** The memory chart now plots % in use (same 0–100 scale as CPU), with absolute figures in its hover text (`Mem used: 35% (22848 MB of 65329 MB)`). The session list's Peak Mem shows both (`22848 MB (35%)`). Total = used + available per sample, now defined once as `MetricSample::mem_total_mb`/`mem_used_pct` (`crates/storage`) and used by the agent's `mem_spike` check too, so spike markers sit where the plotted curve crosses the threshold. `Store::session_summary` gained `peak_mem_used_pct`, its SQL mirroring that definition (test checks they agree, and that a zero total yields `None` rather than dividing by zero). Tests: `mem_used_pct_is_used_over_used_plus_available`, `memory_hover_shows_percent_and_absolute_megabytes`.
+- [x] **Export bar always visible.** The export controls (path, CSV/JSON, Export, result) moved out of the scrolling page into a bottom `egui::Panel` drawn by `app.rs` for the detail view, like a status bar. Previously they sat below the process table and needed scrolling past every chart to reach.
+  - Unit-tested, built and launched on Windows (UI responding, no log errors), but **not yet checked on screen**: during that run the whole desktop captured as black (not just GhostPerf; display asleep or session not visible), so the UI wasn't driven blind.
 - [ ] **The tray costs ~1.4% of one core while idle** (measured over 10 s; ~0.07% of this 20-core machine), most likely from `supervisor::is_agent_running` refreshing every process on the system once a second. Not a Phase 4 issue; relevant to Phase 5's resource-usage self-check.
 
 Not verified on Windows: "Open UI" from the tray menu (tray menu clicks are still manual-only, see Phase 3), and behavior at 100%/other DPI scalings or on a second monitor.
@@ -182,3 +186,57 @@ Not verified on Windows: "Open UI" from the tray menu (tray menu clicks are stil
 - [ ] FPS counter — the hard part: there's no OS-level "current game FPS" counter, so this needs either a present-call hook into the game's graphics API (DXGI/D3D11/D3D12 swap chain `Present`, eventually D3D9/Vulkan/OpenGL) or reusing an existing capture mechanism (e.g. the approach behind PresentMon). Needs its own research/spike before committing to an implementation — this is a different engineering problem from the rest of the app (injection/hooking vs. passive counters) and may deserve its own design doc
 - [ ] Overlay on/off toggle via tray menu and a global hotkey
 - [ ] Configurable overlay position, opacity, and refresh rate; keep its own CPU/GPU footprint negligible since it runs continuously *during* the gaming session it's trying not to disturb
+
+### Phase 7 — Live session view
+Watch a session while it records, instead of only after it stops.
+
+Where things stand: the UI loads a session once (`DetailView::load`), so a recording session (`ended_at` NULL, shown as "recording…" in the list) is a frozen snapshot. The DB also lags the live data. The agent buffers samples and stall/spike events in memory and writes them every `flush_batch_size` (30) samples or `flush_interval_ms` (10 s), whichever comes first, and Event Log entries are only correlated when the session stops.
+
+- [ ] **Live data path from agent to UI.** Options:
+  - (a) The UI polls the DB for rows newer than the last one it has. Simple, read-only, and fine under WAL, but up to ~10 s behind.
+  - (b) A new control-channel command (e.g. `tail <since_ts>`) returning the agent's buffered, unflushed samples and events as one JSON line, which the UI merges with what's already on disk.
+  - (c) Lower the flush interval while a session records. Simplest, but more disk writes, which the batching was there to avoid.
+
+  Leaning (a) + (b): ~1 s latency with no extra disk I/O. (b) is also what Phase 6's overlay needs ("reuse the agent's existing sampler … rather than sampling a second time"), so design it for both.
+- [ ] **Auto-refresh the detail view while `ended_at` is NULL**, about every `sample_interval_ms` (`ctx.request_repaint_after`), appending new points rather than reloading the whole session. Stop refreshing, and pick up the Event Log entries, once the session ends.
+- [ ] **Follow mode:** the charts show a trailing window (e.g. the last 5 min) that scrolls with new data. Panning or zooming pauses following, and a "Jump to live" button resumes it. The overview strip keeps growing with the session, and brush-select keeps working on recorded data.
+- [ ] **Live session list:** duration and summary stats of the recording session update in place, with a clear "● recording" marker.
+- [ ] **Open straight into the live view from the tray:** "Open UI" while recording opens the current session (e.g. a `ghostperf-ui --session <id>` / `--live` argument). Optionally, Start/Stop from the UI too.
+- [ ] **Keep it cheap for long sessions:** incremental appends instead of re-collecting every series each frame; throttle the per-process re-aggregation (`process_agg::aggregate_processes`) to about once a second.
+
+### Phase 8 — Temperatures and thermal throttling
+Record temperatures where the machine exposes them (CPU, GPU, …), to spot heat-related problems.
+
+Probed on the Windows 11 dev machine (i7-12700KF, RTX 3060 Ti), non-elevated, 2026-11-17. The agent runs non-elevated (the tray spawns it), so admin-only sources don't count unless Phase 5 moves it into a service.
+
+| Source | Reads | Admin? | On the dev machine |
+|---|---|---|---|
+| NVIDIA NVML (`nvml.dll`, ships with the driver) | GPU temp | No | Present; GPU at 30.8 °C via `nvidia-smi` |
+| D3DKMT `KMTQAITYPE_ADAPTERPERFDATA` → `D3DKMT_ADAPTER_PERFDATA.Temperature` (deci-°C), vendor-neutral, what Task Manager shows, WDDM 2.9+ | GPU temp | No (believed) | Not yet probed; needs the scratch-crate treatment from `AGENTS.md` |
+| PDH `\Thermal Zone Information(*)\Temperature` (Kelvin) | ACPI thermal zones | No | One zone, `\_tz.tz00`, at 27.9 °C: a board/chassis zone, **not** the CPU die |
+| WMI `root\WMI` `MSAcpi_ThermalZoneTemperature` (the source `sysinfo`'s `Components` uses on Windows) | Same ACPI zones | Yes | Access denied; don't rely on `sysinfo` for temps here |
+| CPU package/core temp (Intel `IA32_PACKAGE_THERM_STATUS` MSR / AMD SMN) | Real CPU die temp | Kernel driver | No user-mode API exists |
+| LibreHardwareMonitor WMI (`root\LibreHardwareMonitor`) or HWiNFO shared memory | Everything those tools see | Only if the user runs them | Neither present |
+| PDH `\Processor Information(_Total)\% Processor Performance`, `% of Maximum Frequency`, `Processor Frequency`, `Performance Limit Flags` | CPU throttling, not temperature | No | All present (idle: 105.8%, 59.0%, 3600 MHz, flags 0) |
+
+- [ ] **GPU temperature:**
+  - NVML (`nvmlDeviceGetTemperature`), loaded dynamically, since `nvml.dll` is absent on non-NVIDIA machines.
+  - Try D3DKMT as a vendor-neutral path, which could cover AMD/Intel GPUs and iGPUs without vendor SDKs. If it doesn't pan out, those need ADLX (AMD) / IGCL (Intel).
+  - Store `None` when unavailable, like `gpu_pct`.
+- [ ] **CPU throttling as the practical CPU signal:**
+  - Sample the four `Processor Information` counters above through the existing PDH query (`platform::windows_impl`).
+  - Under load, a drop in `% Processor Performance` or non-zero `Performance Limit Flags` shows thermal or power limiting even where no CPU temperature is readable, and that's the symptom of a heat problem.
+  - The meaning of the individual flag bits still needs confirming.
+- [ ] **CPU die temperature, only through a safe source:**
+  - Don't ship WinRing0, the driver older monitoring tools used for MSR access. It's on Microsoft's vulnerable-driver blocklist, and Defender flags it.
+  - Options: optional pass-through from LibreHardwareMonitor or HWiNFO when the user runs one, or later a signed driver (e.g. PawnIO, which LibreHardwareMonitor moved to), weighed against Phase 5's installer.
+- [ ] **ACPI thermal zones:** record them via PDH (no admin) but label them as board zones, not CPU temperature.
+- [ ] **Storage:** sensor counts vary by machine (several GPUs, several zones), so store temperatures as a JSON column of `{sensor, celsius}` (like `cpu_per_core_json`), with throttling as plain columns. Add a schema migration like Phase 2's, and a Linux stand-in (`/sys/class/thermal`) per the platform-split convention in `AGENTS.md`.
+- [ ] **Detection:**
+  - `thermal_throttle` events (sustained performance drop under load, or limit flags set).
+  - `temp_spike` events above configurable thresholds (e.g. `gpu_temp_threshold_c`).
+  - Both drawn as event markers like stalls and spikes.
+- [ ] **UI:**
+  - A temperature chart (°C, one line per sensor) and a CPU-performance % chart, aligned with the others (`Y_AXIS_WIDTH`).
+  - Peak temperatures in the session list and the CSV/JSON export.
+  - Clear "not available on this machine" states instead of empty charts.

@@ -1,11 +1,111 @@
-use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
+use egui_plot::{HoverPosition, Legend, Line, Plot, PlotPoints, VLine};
 use storage::{Event, MetricSample, Session};
 
 use crate::app::Action;
 use crate::data::Db;
 use crate::export;
-use crate::format::{format_datetime, format_duration};
+use crate::format::{format_datetime, format_duration, format_mb, format_pct, format_rate};
 use crate::process_agg::aggregate_processes;
+
+/// One y-axis width (ui points) for every chart *and* the overview strip.
+/// `egui_plot` otherwise sizes each plot's y-axis to its own tick labels
+/// ("100" vs "20000000"), so each plot area started at a different x and
+/// the same timestamp was drawn up to ~50 px apart from one chart to the
+/// next (measured on the first Windows run), which defeats reading down
+/// the stack. The axis still grows if a label is wider than this, so the
+/// `format_*` label functions are kept short enough to fit (see the
+/// `format` tests).
+const Y_AXIS_WIDTH: f32 = 72.0;
+const PLOT_HEIGHT: f32 = 140.0;
+
+/// Y grid step sizes for `egui_plot::uniform_grid_spacer`: the smallest of
+/// 1, 2, 10, 20, 100, 200, … that's at least `base_step_size` (the plot-unit
+/// size of `egui_plot`'s minimum grid spacing), plus the next two.
+///
+/// Replaces `egui_plot`'s default powers-of-10 grid, whose levels are 10×
+/// apart. Tick labels are only drawn where marks are > 20 pt apart, so at
+/// some zoom levels the 10s were too dense to label and the 100s were all
+/// out of view, and the axis showed no labels at all (box-zooming the CPU
+/// chart to ~15–88% did exactly that on the first Windows run). Here
+/// consecutive levels are at most 5× apart, so one of them always lands in
+/// a labelable spacing. Each step is a multiple of the previous one, so the
+/// grid lines still nest evenly.
+fn nice_grid_steps(input: egui_plot::GridInput) -> [f64; 3] {
+    let base = input.base_step_size.abs().max(f64::MIN_POSITIVE);
+    let next = |s: f64| {
+        let mantissa = s / 10f64.powi(s.log10().floor() as i32);
+        if mantissa < 1.5 {
+            s * 2.0
+        } else {
+            s * 5.0
+        }
+    };
+    let mut step = 10f64.powi(base.log10().floor() as i32);
+    while step < base {
+        step = next(step);
+    }
+    let s1 = next(step);
+    [step, s1, next(s1)]
+}
+
+/// Hover text: series name and value in its unit, then the time. Event
+/// markers (`VLine`s, named after their kind) get just their name and time:
+/// the "value" of a vertical line is only wherever the cursor happens to be.
+fn hover_label(
+    pos: &HoverPosition<'_>,
+    fmt: fn(f64) -> String,
+    event_kinds: &[String],
+) -> Option<String> {
+    Some(match pos {
+        HoverPosition::NearDataPoint {
+            plot_name,
+            position,
+            ..
+        } if event_kinds.iter().any(|k| k == plot_name) => {
+            format!("{plot_name}\n{:.1} s", position.x)
+        }
+        HoverPosition::NearDataPoint {
+            plot_name,
+            position,
+            ..
+        } => format!("{plot_name}: {}\n{:.1} s", fmt(position.y), position.x),
+        HoverPosition::Elsewhere { position } => {
+            format!("{}\n{:.1} s", fmt(position.y), position.x)
+        }
+    })
+}
+
+const MEM_SERIES: &str = "Mem used";
+
+/// The memory chart plots percent of total, so the absolute figures that
+/// used to be its y-axis live in its hover text instead:
+/// `Mem used: 35% (22848 MB of 65329 MB)`. `mem_mb[i]` is `(used, total)`
+/// for the `i`th plotted point, which is what `index` refers to.
+fn mem_hover_label(
+    pos: &HoverPosition<'_>,
+    mem_mb: &[(f32, f32)],
+    event_kinds: &[String],
+) -> Option<String> {
+    if let HoverPosition::NearDataPoint {
+        plot_name,
+        position,
+        index,
+    } = pos
+    {
+        if *plot_name == MEM_SERIES {
+            if let Some(&(used, total)) = mem_mb.get(*index) {
+                return Some(format!(
+                    "{MEM_SERIES}: {} ({} of {})\n{:.1} s",
+                    format_pct(position.y),
+                    format_mb(used as f64),
+                    format_mb(total as f64),
+                    position.x
+                ));
+            }
+        }
+    }
+    hover_label(pos, format_pct, event_kinds)
+}
 
 /// Color per event `kind`, shared between the chart markers and the legend
 /// so a stall always looks like a stall across the view.
@@ -30,6 +130,11 @@ pub struct DetailView {
     label_edit: String,
     export_path: String,
     export_as_json: bool,
+    /// Result of the last Export click (`Ok(path)` / `Err(message)`), shown
+    /// next to the export controls rather than in `status`; see
+    /// `export_controls`.
+    export_status: Option<Result<String, String>>,
+    /// Rename/delete failures, shown under the header next to those buttons.
     status: Option<String>,
     delete_confirm: bool,
 }
@@ -57,6 +162,7 @@ impl DetailView {
             label_edit,
             export_path,
             export_as_json: false,
+            export_status: None,
             status: None,
             delete_confirm: false,
         })
@@ -146,9 +252,8 @@ impl DetailView {
         ui.separator();
         self.process_table(ui);
 
-        ui.separator();
-        self.export_controls(ui);
-
+        // Export controls aren't drawn here: they live in a bottom panel,
+        // always visible like a status bar; see `app.rs`.
         action
     }
 
@@ -162,11 +267,23 @@ impl DetailView {
             .iter()
             .map(|m| [seconds_of(m.ts), m.cpu_pct as f64])
             .collect();
-        let mem_points: PlotPoints = self
+        // Percent of total (same scale as CPU, and the same definition as the
+        // agent's `mem_spike` threshold, so its markers sit where this curve
+        // crosses it). Samples without memory figures are skipped, so the
+        // absolute (used, total) MB list is built from the same filtered
+        // sequence to keep hover indices aligned with plotted points.
+        let (mem_points, mem_mb): (Vec<[f64; 2]>, Vec<(f32, f32)>) = self
             .metrics
             .iter()
-            .map(|m| [seconds_of(m.ts), m.mem_used_mb as f64])
-            .collect();
+            .filter_map(|m| {
+                let pct = m.mem_used_pct()?;
+                Some((
+                    [seconds_of(m.ts), pct as f64],
+                    (m.mem_used_mb, m.mem_total_mb()),
+                ))
+            })
+            .unzip();
+        let mem_points = PlotPoints::from(mem_points);
         let disk_read_points: PlotPoints = self
             .metrics
             .iter()
@@ -188,13 +305,6 @@ impl DetailView {
             .map(|m| [seconds_of(m.ts), m.net_tx_bps])
             .collect();
 
-        let plot_height = 140.0;
-        // Scroll-wheel is left to the page's outer ScrollArea, not the
-        // individual plots: this whole view can be taller than the window,
-        // and a plot capturing the wheel while the user scrolls past it
-        // pans the plot into a nonsensical range instead of scrolling the
-        // page. Left-drag-to-pan and right-drag-to-box-zoom (both on by
-        // default) still cover "zoom/pan on charts" without the wheel.
         let add_events = |plot_ui: &mut egui_plot::PlotUi| {
             for e in events {
                 plot_ui.vline(
@@ -202,57 +312,62 @@ impl DetailView {
                 );
             }
         };
+        let event_kinds: Vec<String> = events.iter().map(|e| e.kind.clone()).collect();
 
-        Plot::new(("cpu", self.session.id))
-            .height(plot_height)
-            .allow_scroll(false)
-            .legend(Legend::default())
-            .link_axis(link_group, [true, false])
-            .link_cursor(link_group, [true, false])
+        // Everything the 4 stacked charts share. Scroll-wheel is left to the
+        // page's outer ScrollArea, not the individual plots: this whole view
+        // can be taller than the window, and a plot capturing the wheel while
+        // the user scrolls past it pans the plot into a nonsensical range
+        // instead of scrolling the page. Left-drag-to-pan and
+        // right-drag-to-box-zoom (both on by default) still cover "zoom/pan
+        // on charts" without the wheel.
+        let chart = |id: &'static str, fmt: fn(f64) -> String| {
+            let event_kinds = event_kinds.clone();
+            Plot::new((id, self.session.id))
+                .height(PLOT_HEIGHT)
+                .allow_scroll(false)
+                .legend(Legend::default())
+                .link_axis(link_group, [true, false])
+                .link_cursor(link_group, [true, false])
+                .y_axis_min_width(Y_AXIS_WIDTH)
+                .y_axis_formatter(move |mark, _range| fmt(mark.value))
+                .y_grid_spacer(egui_plot::uniform_grid_spacer(nice_grid_steps))
+                .label_formatter(move |pos| hover_label(pos, fmt, &event_kinds))
+        };
+
+        chart("cpu", format_pct).show(ui, |plot_ui| {
+            plot_ui.line(Line::new("CPU", cpu_points));
+            add_events(plot_ui);
+        });
+        let mem_kinds = event_kinds.clone();
+        chart("mem", format_pct)
+            .label_formatter(move |pos| mem_hover_label(pos, &mem_mb, &mem_kinds))
             .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("CPU %", cpu_points));
+                plot_ui.line(Line::new(MEM_SERIES, mem_points));
                 add_events(plot_ui);
             });
-
-        Plot::new(("mem", self.session.id))
-            .height(plot_height)
-            .allow_scroll(false)
-            .legend(Legend::default())
-            .link_axis(link_group, [true, false])
-            .link_cursor(link_group, [true, false])
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("Mem used (MB)", mem_points));
-                add_events(plot_ui);
-            });
-
-        Plot::new(("disk", self.session.id))
-            .height(plot_height)
-            .allow_scroll(false)
-            .legend(Legend::default())
-            .link_axis(link_group, [true, false])
-            .link_cursor(link_group, [true, false])
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("Read B/s", disk_read_points));
-                plot_ui.line(Line::new("Write B/s", disk_write_points));
-                add_events(plot_ui);
-            });
-
-        Plot::new(("net", self.session.id))
-            .height(plot_height)
-            .allow_scroll(false)
-            .legend(Legend::default())
-            .link_axis(link_group, [true, false])
-            .link_cursor(link_group, [true, false])
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("Rx B/s", net_rx_points));
-                plot_ui.line(Line::new("Tx B/s", net_tx_points));
-                add_events(plot_ui);
-            });
+        chart("disk", format_rate).show(ui, |plot_ui| {
+            plot_ui.line(Line::new("Disk read", disk_read_points));
+            plot_ui.line(Line::new("Disk write", disk_write_points));
+            add_events(plot_ui);
+        });
+        chart("net", format_rate).show(ui, |plot_ui| {
+            plot_ui.line(Line::new("Net rx", net_rx_points));
+            plot_ui.line(Line::new("Net tx", net_tx_points));
+            add_events(plot_ui);
+        });
 
         // Overview/selector strip: drag is reserved entirely for brush
         // selection (see `drag_start`/`selection`), so pan/zoom/box-zoom are
         // all disabled here — the 4 charts above already provide those via
         // their native egui_plot interactions.
+        //
+        // Deliberately *not* in `link_group`: it's the whole-session map you
+        // brush-select on, so it must keep showing the whole session while
+        // the charts above are zoomed in (when it was linked, zooming the
+        // charts zoomed it too, and you could then only select inside the
+        // zoomed range). Its y-axis is shown but blank, at the same width as
+        // the charts', purely so its x positions line up with theirs.
         let overview_points: PlotPoints = self
             .metrics
             .iter()
@@ -260,13 +375,21 @@ impl DetailView {
             .collect();
         let response = Plot::new(("overview", self.session.id))
             .height(60.0)
-            .show_axes([true, false])
+            .show_axes([true, true])
             .show_grid([true, false])
+            .y_axis_min_width(Y_AXIS_WIDTH)
+            .y_axis_formatter(|_mark, _range| String::new())
+            .label_formatter(|pos| {
+                let x = match pos {
+                    HoverPosition::NearDataPoint { position, .. }
+                    | HoverPosition::Elsewhere { position } => position.x,
+                };
+                Some(format!("{x:.1} s"))
+            })
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
             .allow_boxed_zoom(false)
-            .link_axis(link_group, [true, false])
             .show(ui, |plot_ui| {
                 plot_ui.line(Line::new("CPU %", overview_points));
                 if let Some((a, b)) = self.selection {
@@ -359,19 +482,60 @@ impl DetailView {
             });
     }
 
-    fn export_controls(&mut self, ui: &mut egui::Ui) {
+    /// The export bar. Drawn by `app.rs` in a bottom panel outside the page's
+    /// ScrollArea, so it's always on screen like a status bar. At the end of
+    /// the scrolling page it was only reachable by scrolling past every
+    /// chart and the whole process table.
+    pub fn export_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Export to:");
-            ui.text_edit_singleline(&mut self.export_path);
+            ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(480.0));
+            let was_json = self.export_as_json;
             ui.radio_value(&mut self.export_as_json, false, "CSV");
             ui.radio_value(&mut self.export_as_json, true, "JSON");
+            if self.export_as_json != was_json {
+                self.export_path = export::path_for_format(&self.export_path, self.export_as_json);
+                self.export_status = None;
+            }
             if ui.button("Export").clicked() {
-                self.status = Some(self.do_export());
+                self.export_status = Some(self.do_export());
+            }
+            // In this same row, right of the button, so the bar keeps one
+            // fixed height. The message used to go in the page's top status
+            // line, which was off-screen when you clicked and pushed the
+            // whole page down ~30 px under the cursor. Kept short (file name
+            // only, truncated if needed) so it fits; the full path or error
+            // is on hover.
+            match &self.export_status {
+                Some(Ok(path)) => {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("✔ Saved {name}"))
+                                .color(egui::Color32::LIGHT_GREEN),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(path);
+                }
+                Some(Err(e)) => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Export failed: {e}"))
+                                .color(egui::Color32::RED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(e);
+                }
+                None => {}
             }
         });
     }
 
-    fn do_export(&self) -> String {
+    fn do_export(&self) -> Result<String, String> {
         let path = std::path::Path::new(&self.export_path);
         let result = (|| -> anyhow::Result<()> {
             if let Some(parent) = path.parent() {
@@ -386,8 +550,109 @@ impl DetailView {
             Ok(())
         })();
         match result {
-            Ok(()) => format!("Exported to {}", path.display()),
-            Err(e) => format!("Export failed: {e:#}"),
+            Ok(()) => {
+                log::info!("exported session {} to {}", self.session.id, path.display());
+                Ok(path.display().to_string())
+            }
+            Err(e) => {
+                log::error!(
+                    "export of session {} to {} failed: {e:#}",
+                    self.session.id,
+                    path.display()
+                );
+                Err(format!("{e:#}"))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steps(base_step_size: f64) -> [f64; 3] {
+        nice_grid_steps(egui_plot::GridInput {
+            bounds: (0.0, 100.0),
+            base_step_size,
+        })
+    }
+
+    fn approx(a: [f64; 3], b: [f64; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() <= y * 1e-9)
+    }
+
+    #[test]
+    fn steps_walk_1_2_10_20_from_the_base() {
+        // The first-Windows-run case: CPU zoomed to ~15–88% in a 140 pt
+        // chart gives a base of ~4.3 → 10/20/100, so 20s get labels.
+        assert!(approx(steps(4.3), [10.0, 20.0, 100.0]));
+        assert!(approx(steps(10.0), [10.0, 20.0, 100.0]));
+        assert!(approx(steps(11.0), [20.0, 100.0, 200.0]));
+        assert!(approx(steps(1.3e6), [2e6, 1e7, 2e7]));
+        assert!(approx(steps(0.03), [0.1, 0.2, 1.0]));
+    }
+
+    #[test]
+    fn consecutive_steps_nest_and_are_at_most_5x_apart() {
+        for base in [0.003, 0.7, 1.0, 4.3, 18.9, 250.0, 7.7e5, 1.3e6] {
+            let [a, b, c] = steps(base);
+            assert!(a >= base, "{base}: first step {a} below base");
+            for (lo, hi) in [(a, b), (b, c)] {
+                let ratio = hi / lo;
+                assert!(ratio > 1.0 && ratio <= 5.0 + 1e-9, "{base}: ratio {ratio}");
+                assert!(
+                    (ratio - ratio.round()).abs() < 1e-9,
+                    "{base}: {hi} not a multiple of {lo}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_hover_shows_percent_and_absolute_megabytes() {
+        let mem_mb = [(20_000.0, 65_329.0), (22_848.0, 65_329.0)];
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: MEM_SERIES,
+            position: egui_plot::PlotPoint::new(17.4, 34.97),
+            index: 1,
+        };
+        assert_eq!(
+            mem_hover_label(&pos, &mem_mb, &[]).as_deref(),
+            Some("Mem used: 35% (22848 MB of 65329 MB)\n17.4 s")
+        );
+        // Event markers on the memory chart still hover as name + time.
+        let kinds = vec!["mem_spike".to_string()];
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: "mem_spike",
+            position: egui_plot::PlotPoint::new(3.0, 50.0),
+            index: 0,
+        };
+        assert_eq!(
+            mem_hover_label(&pos, &mem_mb, &kinds).as_deref(),
+            Some("mem_spike\n3.0 s")
+        );
+    }
+
+    #[test]
+    fn event_markers_hover_with_name_and_time_only() {
+        let kinds = vec!["cpu_spike".to_string()];
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: "cpu_spike",
+            position: egui_plot::PlotPoint::new(17.4, 55.0),
+            index: 0,
+        };
+        assert_eq!(
+            hover_label(&pos, format_pct, &kinds).as_deref(),
+            Some("cpu_spike\n17.4 s")
+        );
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: "Disk read",
+            position: egui_plot::PlotPoint::new(16.0, 21_700_000.0),
+            index: 3,
+        };
+        assert_eq!(
+            hover_label(&pos, format_rate, &kinds).as_deref(),
+            Some("Disk read: 22 MB/s\n16.0 s")
+        );
     }
 }

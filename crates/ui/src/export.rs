@@ -13,6 +13,31 @@ struct JsonExport<'a> {
     events: &'a [Event],
 }
 
+/// `path` adjusted to the chosen format when switching CSV/JSON.
+///
+/// Swaps the extension only when it's the *other* format's (`.csv` ↔
+/// `.json`), so a name the user typed themselves (`report.txt`, no
+/// extension) is left alone. Without this, picking JSON kept the default
+/// `session-<id>.csv` path, and the JSON export silently overwrote an
+/// earlier CSV export of the same session (found on the first Windows run).
+pub fn path_for_format(path: &str, json: bool) -> String {
+    let (from, to) = if json {
+        (".csv", ".json")
+    } else {
+        (".json", ".csv")
+    };
+    // `get` rather than slicing: a non-ASCII char right before the
+    // extension would otherwise panic on a non-char-boundary index.
+    match path
+        .len()
+        .checked_sub(from.len())
+        .and_then(|i| Some((i, path.get(i..)?)))
+    {
+        Some((i, ext)) if ext.eq_ignore_ascii_case(from) => format!("{}{to}", &path[..i]),
+        _ => path.to_string(),
+    }
+}
+
 pub fn export_json(
     session: &Session,
     metrics: &[MetricSample],
@@ -75,6 +100,31 @@ pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Resul
 mod tests {
     use super::*;
     use storage::ProcessSample;
+
+    #[test]
+    fn switching_format_swaps_the_other_formats_extension() {
+        assert_eq!(
+            path_for_format(r"C:\x\exports\session-7.csv", true),
+            r"C:\x\exports\session-7.json"
+        );
+        assert_eq!(
+            path_for_format(r"C:\x\exports\session-7.json", false),
+            r"C:\x\exports\session-7.csv"
+        );
+        assert_eq!(path_for_format("a.CSV", true), "a.json");
+    }
+
+    #[test]
+    fn switching_format_leaves_custom_names_alone() {
+        // Already the right extension, a user-chosen one, or none at all.
+        assert_eq!(path_for_format("a.json", true), "a.json");
+        assert_eq!(path_for_format("report.txt", true), "report.txt");
+        assert_eq!(path_for_format("report", false), "report");
+        assert_eq!(path_for_format("", true), "");
+        // Must not panic on a multi-byte char just before the extension.
+        assert_eq!(path_for_format("é.csv", true), "é.json");
+        assert_eq!(path_for_format("éé", true), "éé");
+    }
 
     fn sample() -> MetricSample {
         MetricSample {
