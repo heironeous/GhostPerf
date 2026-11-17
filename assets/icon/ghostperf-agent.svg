@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="gp-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4A5263"/>
+      <stop offset="1" stop-color="#15181F"/>
+    </linearGradient>
+    <linearGradient id="gp-ghost" x1="0" y1="40" x2="0" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0.45" stop-color="#F3F5FF"/>
+      <stop offset="1" stop-color="#C5CBF2"/>
+    </linearGradient>
+  </defs><rect width="256" height="256" rx="56" fill="url(#gp-bg)"/><rect x="56.00" y="132" width="27.75" height="58" rx="8" fill="url(#gp-ghost)"/><rect x="94.75" y="132" width="27.75" height="72" rx="8" fill="url(#gp-ghost)"/><rect x="133.50" y="132" width="27.75" height="64" rx="8" fill="url(#gp-ghost)"/><rect x="172.25" y="132" width="27.75" height="94" rx="8" fill="#3DE0B5"/><path d="M56,162 V110.0 A72.0,72.0 0 0 1 200,110.0 V162 Z" fill="url(#gp-ghost)"/><ellipse cx="104.0" cy="106" rx="12" ry="16" fill="#15181F"/><ellipse cx="152.0" cy="106" rx="12" ry="16" fill="#15181F"/><circle cx="212" cy="44" r="44" fill="#15181F"/><circle cx="212" cy="44" r="34" fill="#3DE0B5"/><rect x="206" y="19" width="12" height="50" rx="2" fill="#15181F" transform="rotate(0 212 44)"/><rect x="206" y="19" width="12" height="50" rx="2" fill="#15181F" transform="rotate(45 212 44)"/><rect x="206" y="19" width="12" height="50" rx="2" fill="#15181F" transform="rotate(90 212 44)"/><rect x="206" y="19" width="12" height="50" rx="2" fill="#15181F" transform="rotate(135 212 44)"/><circle cx="212" cy="44" r="18" fill="#15181F"/><circle cx="212" cy="44" r="7" fill="#3DE0B5"/></svg>

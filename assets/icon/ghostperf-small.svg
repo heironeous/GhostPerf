@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="gp-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2B3070"/>
+      <stop offset="1" stop-color="#13152E"/>
+    </linearGradient>
+    <linearGradient id="gp-ghost" x1="0" y1="40" x2="0" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0.45" stop-color="#F3F5FF"/>
+      <stop offset="1" stop-color="#C5CBF2"/>
+    </linearGradient>
+  </defs><rect width="256" height="256" rx="56" fill="url(#gp-bg)"/><rect x="42.00" y="140" width="44.00" height="64" rx="6" fill="url(#gp-ghost)"/><rect x="106.00" y="140" width="44.00" height="52" rx="6" fill="url(#gp-ghost)"/><rect x="170.00" y="140" width="44.00" height="92" rx="6" fill="#3DE0B5"/><path d="M42,170 V116.0 A86.0,86.0 0 0 1 214,116.0 V170 Z" fill="url(#gp-ghost)"/><ellipse cx="98.0" cy="108" rx="17" ry="23" fill="#13152E"/><ellipse cx="158.0" cy="108" rx="17" ry="23" fill="#13152E"/></svg>

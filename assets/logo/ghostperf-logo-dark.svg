@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 256" width="1040" height="256">
+  <defs>
+    <linearGradient id="gp-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2B3070"/>
+      <stop offset="1" stop-color="#13152E"/>
+    </linearGradient>
+    <linearGradient id="gp-ghost" x1="0" y1="40" x2="0" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0.45" stop-color="#F3F5FF"/>
+      <stop offset="1" stop-color="#C5CBF2"/>
+    </linearGradient>
+  </defs><rect width="256" height="256" rx="56" fill="url(#gp-bg)"/><rect x="56.00" y="132" width="27.75" height="58" rx="8" fill="url(#gp-ghost)"/><rect x="94.75" y="132" width="27.75" height="72" rx="8" fill="url(#gp-ghost)"/><rect x="133.50" y="132" width="27.75" height="64" rx="8" fill="url(#gp-ghost)"/><rect x="172.25" y="132" width="27.75" height="94" rx="8" fill="#3DE0B5"/><path d="M56,162 V110.0 A72.0,72.0 0 0 1 200,110.0 V162 Z" fill="url(#gp-ghost)"/><ellipse cx="104.0" cy="106" rx="12" ry="16" fill="#13152E"/><ellipse cx="152.0" cy="106" rx="12" ry="16" fill="#13152E"/><text x="296" y="178" font-family="'Segoe UI Variable Display', 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="148" font-weight="700" letter-spacing="-3" fill="#F3F5FF">Ghost<tspan fill="#3DE0B5">Perf</tspan></text></svg>

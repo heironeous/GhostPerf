@@ -1,3 +1,8 @@
+//! `AgentConfig` and the `agent.toml` load/default path, split out of the
+//! `agent` crate so other processes (the tray) can read the same config
+//! file — in particular `control_port` — without duplicating the format or
+//! its defaulting rules.
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

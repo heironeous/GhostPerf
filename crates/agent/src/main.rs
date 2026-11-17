@@ -1,4 +1,3 @@
-mod config;
 mod core;
 mod eventlog;
 mod ipc;
@@ -11,8 +10,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent_config::AgentConfig;
 use anyhow::Context;
-use config::AgentConfig;
 use storage::Store;
 
 pub fn now_millis() -> i64 {

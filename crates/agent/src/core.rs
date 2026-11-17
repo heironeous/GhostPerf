@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use storage::{MetricSample, NewEvent, Store};
 
-use crate::config::AgentConfig;
 use crate::eventlog;
 use crate::now_millis;
+use agent_config::AgentConfig;
 
 pub enum CoreMsg {
     Start {

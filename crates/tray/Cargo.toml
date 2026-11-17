@@ -8,3 +8,22 @@ name = "ghostperf-tray"
 path = "src/main.rs"
 
 [dependencies]
+agent_config = { path = "../agent_config" }
+tray-icon = "0.26"
+tao = "0.37"
+sysinfo = "0.31"
+anyhow = "1"
+# Decodes the embedded fallback tray-icon PNGs (see src/icons.rs). Already in
+# the tree via tray-icon/muda, so this adds nothing new to the build.
+png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_System_Registry",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Embeds assets/icon/*.ico into the exe (see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"

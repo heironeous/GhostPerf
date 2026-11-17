@@ -7,7 +7,7 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 | Component | Language / Stack | Why |
 |---|---|---|
 | **Agent** (background collector) | Rust (`windows` crate for perf counters/ETW, `rusqlite` for storage) | Compiles to a small native binary, no runtime/GC, minimal idle CPU & memory footprint — critical since this runs continuously in the background on the machine it's measuring. |
-| **Tray** (control icon) | Rust (`tray-icon` + `tao`) | Keeps the always-running footprint entirely in one lightweight language; talks to the Agent over a named pipe and can spawn the UI process. |
+| **Tray** (control icon) | Rust (`tray-icon` + `tao`) | Keeps the always-running footprint entirely in one lightweight language; talks to the Agent over the same loopback TCP control channel as any other client (see IPC below) and can spawn the UI process. |
 | **UI** (session viewer) | Rust (`egui`, rendered natively via `wgpu`/OpenGL), charts via `egui_plot` | Maximizes performance: no webview, no GC, no runtime startup cost — and keeps the whole stack in one language so SQLite access/types can be shared directly with the agent/tray. |
 | **Storage** | SQLite (single file per machine, one `sessions` table + one `metrics` table, WAL mode) | Local, zero-dependency, fast sequential writes in WAL mode, easy ad-hoc querying for the UI, trivial to back up/inspect. |
 
@@ -76,13 +76,26 @@ Built (MSVC, debug + release via `build.ps1 -Test`) and smoke-tested on Windows 
 Observed: `thread::sleep` wakeup jitter on Windows 11 maxed at ~0.7 ms over 220 wakeups, so the 50 ms default `stall_threshold_ms` has plenty of headroom.
 
 ### Phase 3 — Tray
-- [ ] Rust project scaffold for tray (`tray/`)
-- [ ] Tray icon with Start/Stop metric gathering menu items
-- [ ] Tray icon reflects current state (idle / recording)
-- [ ] "Open UI" menu item — launches UI process (or focuses existing window)
-- [ ] Named-pipe client to send `start`/`stop`/`status` to agent
-- [ ] Autostart with Windows (optional toggle)
-- [ ] Agent process supervision (launch agent if not running; detect crashes)
+- [x] Rust project scaffold for tray (`tray/`) — `tray-icon` + `tao`
+- [x] Tray icon with Start/Stop metric gathering menu items, plus Open UI / Start with Windows (checkbox) / Quit
+- [x] Tray icon reflects current state (idle / recording) — polls `status` every second and swaps a runtime-generated grey/red circle icon (`crates/tray/src/icons.rs`, no image assets)
+- [x] "Open UI" menu item — launches `ghostperf-ui` if it isn't already running; see note below on focusing an existing window
+- [x] Control-channel client to send `start`/`stop`/`status` to the agent — TCP, not a named pipe (see IPC note at the top of this doc; that bullet's wording predates the Phase 1 IPC decision) (`crates/tray/src/ipc_client.rs`)
+- [x] Autostart with Windows (optional toggle) — `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`crates/tray/src/autostart/`)
+- [x] Agent process supervision (launch agent if not running; detect crashes) — scans for a `ghostperf-agent` process by name once a second and relaunches if it's gone (`crates/tray/src/supervisor.rs`)
+
+Pulled `AgentConfig` out of `agent` into a new `agent_config` crate (`crates/agent_config`) so the tray can read `control_port` from the same `agent.toml` without duplicating the config format or its defaulting rules.
+
+Architecture note: `main.rs` pushes both the 1-second poll and `muda`'s menu-click events into the `tao` event loop through an `EventLoopProxy` (a `TickEvent::{Poll, Menu}` user event), rather than having the loop itself poll on `ControlFlow::WaitUntil`/`Poll`. This is both the idiomatic way tray-icon examples integrate a background timer with a `tao` loop, and a fix for something found during smoke-testing below.
+
+"Open UI" doesn't focus an existing window yet — the UI (Phase 4) doesn't have a real window to focus. It currently just avoids spawning a second copy by checking for a running `ghostperf-ui` process. Once Phase 4 exists, replace that check with an actual focus (`FindWindowW` + `SetForegroundWindow` on Windows).
+
+Smoke-tested end-to-end on Linux (dev environment, headless: `Xvfb` + `dbus-launch`, no window manager or status-notifier host): tray launched the agent, a real session was started/recorded/stopped over the control channel, and killing the agent process out from under the tray triggered a relaunch within one poll tick. All of this required two fixes made during that smoke test:
+
+- **`is_agent_running`/`open_ui`'s process scan matched zombie processes.** A killed child whose parent hasn't `wait()`-ed on it is still enumerated by `sysinfo` (status `Zombie`), so the supervisor saw the dead agent's zombie entry and concluded it was still running, and never relaunched it. Both scans now exclude `ProcessStatus::Zombie` (`crates/tray/src/supervisor.rs`, `crates/tray/src/open_ui.rs`).
+- **`ControlFlow::WaitUntil` (and `Poll`) never reliably woke the loop** in this headless container: a tray icon with no window and no window manager/compositor driving the GTK main loop meant `tao`'s timer-based wakeups fired once (at startup) and then stopped. Switching to the `EventLoopProxy` push-based design above fixed it — confirmed back-to-back with `WaitUntil` (ticked once in 4+ seconds) vs. the proxy approach (ticked on schedule every second). Whether `WaitUntil` would have been fine on a real Windows desktop or a full Linux desktop session is untested; the proxy design sidesteps the question either way and is the more idiomatic choice regardless.
+
+Not yet run on real Windows (needs the same first-real-run shakeout the agent got in Phase 1/2): the registry autostart (`crates/tray/src/autostart/windows_impl.rs`) is only compile-checked, via `cargo check --target x86_64-pc-windows-gnu` (this container has no MSVC `lib.exe` to check the `msvc` triple — see the Phase 2 note on this). Tray-icon rendering and click handling on real Windows is also unverified beyond compilation; this container's headless Linux smoke test exercises the supervision/IPC/autostart-file logic but not an actual visible tray icon or a real mouse click on a menu item.
 
 ### Phase 4 — UI
 - [ ] Rust project scaffold for UI (`ui/`), `egui`/`eframe` app
@@ -98,7 +111,17 @@ Observed: `thread::sleep` wakeup jitter on Windows 11 maxed at ~0.7 ms over 220 
 
 ### Phase 5 — Packaging & polish
 - [ ] Single installer (MSI/NSIS) that installs agent + tray + UI and registers autostart
+- [ ] Portable version: a zip of the three binaries that runs with no installer, no registry entries, and no autostart — config/DB default to a path next to the executable instead of `%APPDATA%` (likely needs a `--portable` flag or auto-detection so the installed and portable builds can share the same binaries)
 - [ ] Data retention/cleanup (auto-prune old sessions past N days or size cap)
 - [ ] Crash resilience: agent restarts cleanly after unexpected shutdown, recovers/closes orphaned session
 - [ ] Resource-usage self-check: verify agent's own CPU/mem footprint stays negligible under load
 - [ ] Documentation: README with build/run instructions for each component
+
+### Phase 6 — Gaming overlay
+- [ ] Rust project scaffold for overlay (`overlay/`) — new binary, launched/toggled from the tray like the UI
+- [ ] Click-through, borderless, always-on-top window so it never steals input or focus from the game (Windows: `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`, topmost, no taskbar entry)
+- [ ] Renders on top of exclusive-fullscreen and borderless-window games alike; handle multi-monitor placement and DPI scaling
+- [ ] Live CPU %, RAM, and GPU usage readout — reuse the agent's existing sampler/PDH counters (Phase 1/2) rather than sampling a second time
+- [ ] FPS counter — the hard part: there's no OS-level "current game FPS" counter, so this needs either a present-call hook into the game's graphics API (DXGI/D3D11/D3D12 swap chain `Present`, eventually D3D9/Vulkan/OpenGL) or reusing an existing capture mechanism (e.g. the approach behind PresentMon). Needs its own research/spike before committing to an implementation — this is a different engineering problem from the rest of the app (injection/hooking vs. passive counters) and may deserve its own design doc
+- [ ] Overlay on/off toggle via tray menu and a global hotkey
+- [ ] Configurable overlay position, opacity, and refresh rate; keep its own CPU/GPU footprint negligible since it runs continuously *during* the gaming session it's trying not to disturb
