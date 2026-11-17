@@ -1,3 +1,8 @@
+// Windowless on Windows: no console window to close by accident (which
+// used to kill the agent with no clean shutdown). All output goes to
+// `agent.log` through the `logging` crate instead.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod core;
 mod eventlog;
 mod instance;
@@ -22,7 +27,23 @@ pub fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    let log_file = logging::init(&agent_config::log_dir(), "agent");
+    log::info!(
+        "starting (pid {}, log {})",
+        std::process::id(),
+        log_file.map_or_else(|| "unavailable".into(), |p| p.display().to_string())
+    );
+    // Returning the error from `main` would print it to a stderr that
+    // doesn't exist in a windowless process, so log it before exiting.
+    if let Err(e) = run() {
+        log::error!("fatal: {e:#}");
+        std::process::exit(1);
+    }
+    log::info!("exited cleanly");
+}
+
+fn run() -> anyhow::Result<()> {
     let config_path = AgentConfig::default_config_path();
     let config = AgentConfig::load_or_default(&config_path)?;
 
@@ -36,8 +57,8 @@ fn main() -> anyhow::Result<()> {
         let port = agent_config::read_port_file(&port_file)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".into());
-        println!(
-            "ghostperf-agent: another agent is already running (control port {port}, per {}); exiting",
+        log::info!(
+            "another agent is already running (control port {port}, per {}); exiting",
             port_file.display()
         );
         return Ok(());
@@ -55,8 +76,8 @@ fn main() -> anyhow::Result<()> {
             port_file.display()
         )
     })?;
-    println!(
-        "ghostperf-agent: db={} control_port={} (written to {}) sample_interval_ms={}",
+    log::info!(
+        "db={} control_port={} (written to {}) sample_interval_ms={}",
         config.db_path.display(),
         control_port,
         port_file.display(),
@@ -66,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     let store = Store::open(&config.db_path)?;
     let closed = store.close_orphaned_sessions(now_millis())?;
     if closed > 0 {
-        println!("ghostperf-agent: closed {closed} orphaned session(s) from a prior run");
+        log::warn!("closed {closed} orphaned session(s) left open by a prior unclean exit");
     }
 
     let (core_tx, core_rx) = mpsc::channel();
@@ -119,10 +140,7 @@ fn main() -> anyhow::Result<()> {
     // against a dead port. Safe to delete unconditionally: we still hold the
     // instance lock, so no other agent can have written it since.
     if let Err(e) = agent_config::remove_port_file(&port_file) {
-        eprintln!(
-            "ghostperf-agent: failed to remove {}: {e}",
-            port_file.display()
-        );
+        log::warn!("failed to remove {}: {e}", port_file.display());
     }
     Ok(())
 }

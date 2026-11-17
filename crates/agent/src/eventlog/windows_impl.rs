@@ -52,7 +52,10 @@ fn correlate_channel(channel: &str, query_str: &[u16]) -> Vec<NewEvent> {
             Ok(h) => h,
             // Channel may not exist on this machine (e.g. no "Application"
             // log in some stripped-down installs) — skip it, not fatal.
-            Err(_) => return out,
+            Err(e) => {
+                log::warn!("skipping Event Log channel {channel}: {e}");
+                return out;
+            }
         };
 
         'pages: loop {

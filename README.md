@@ -16,6 +16,7 @@ Three binaries, one shared storage format, talking over a local loopback TCP con
 | `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI". |
 | `crates/ui` | `ghostperf-ui` | Session viewer (not implemented yet — Phase 4). |
 | `crates/storage` | (lib) | SQLite schema + queries, shared by `agent` and (eventually) `ui`. |
+| `crates/logging` | (lib) | File logging for the (windowless) binaries: the `log` facade backed by `%APPDATA%\GhostPerf\logs\<binary>.log`, plus panic logging. |
 | `crates/agent_config` | (lib) | `AgentConfig` and the `agent.toml` load/default logic, plus the `agent.port` file the agent advertises its control port in — shared by `agent` and `tray` (and later `ui`) so all agree on these without duplicating the format. |
 
 See [`TODO.md`](TODO.md) for the full architecture write-up (data model, IPC protocol, why each language/library choice was made) and [`assets/README.md`](assets/README.md) for the icon/branding assets and how to regenerate them.
@@ -47,8 +48,11 @@ On Linux, building `crates/tray` pulls in `tray-icon`/`tao`'s GTK backend and ne
 
 1. Start `ghostperf-tray` (the agent doesn't need to be started separately — the tray launches it if it isn't already running, and relaunches it if it crashes).
 2. Use the tray menu to start/stop a recording session.
+3. **Quit** in the tray menu also shuts the agent down: any recording in progress is stopped and saved, then both processes exit.
 
-Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does). The SQLite database defaults to `%APPDATA%\GhostPerf\ghostperf.db`. On non-Windows dev builds, both default under the OS temp dir instead, since `%APPDATA%` doesn't exist.
+Neither binary opens a window or console on Windows (the tray is just the tray icon). Their output goes to `%APPDATA%\GhostPerf\logs\agent.log` and `tray.log`: startup, the control port, session start/stop, relaunches, and any errors or panics. Each file is rotated to `.log.1` once it passes 5 MiB. Check these logs first when something doesn't behave.
+
+Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does). The SQLite database defaults to `%APPDATA%\GhostPerf\ghostperf.db`. On non-Windows dev builds, both (and the `logs` directory) default under the OS temp dir instead, since `%APPDATA%` doesn't exist.
 
 The agent also exposes a plain-text control protocol on a loopback TCP port: one newline-terminated command per connection (`start [label]`, `stop`, `status`, `shutdown`), one line of reply. The port isn't configurable: the OS assigns a free one each time the agent starts, and the agent writes it to `agent.port` next to `agent.toml` (deleted again on clean shutdown). This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
 

@@ -1,3 +1,8 @@
+// Windowless on Windows: as a console program the tray owned a console
+// window, and closing it killed the tray and the agent (which inherited
+// it) with no clean shutdown. Output goes to `tray.log` instead.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod autostart;
 mod icons;
 mod ipc_client;
@@ -37,24 +42,42 @@ enum TickEvent {
 /// dropped so a click that did nothing can be diagnosed.
 fn send_to_agent(port: Option<u16>, command: &str) {
     let Some(port) = port else {
-        eprintln!(
-            "ghostperf-tray: '{command}' not sent — agent hasn't published a control port yet"
-        );
+        log::warn!("'{command}' not sent — agent hasn't published a control port yet");
         return;
     };
-    if let Err(e) = ipc_client::send_command(port, command) {
-        eprintln!("ghostperf-tray: '{command}' to agent on port {port} failed: {e}");
+    match ipc_client::send_command(port, command) {
+        Ok(reply) => log::info!("'{command}' -> {reply}"),
+        Err(e) => log::warn!("'{command}' to agent on port {port} failed: {e}"),
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    let log_file = logging::init(&agent_config::log_dir(), "tray");
+    log::info!(
+        "starting (pid {}, log {})",
+        std::process::id(),
+        log_file.map_or_else(|| "unavailable".into(), |p| p.display().to_string())
+    );
+    // See the agent's `main`: a returned error would go to a stderr that
+    // doesn't exist in a windowless process.
+    if let Err(e) = run() {
+        log::error!("fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     // Re-read on every use, never cached: the agent picks a new port each
     // time it starts, including every crash-relaunch below.
     let port_file = agent_config::port_file_path();
     let agent_port = move || agent_config::read_port_file(&port_file);
 
     let mut sys = System::new();
-    supervisor::ensure_agent_running(&mut sys)?;
+    if supervisor::ensure_agent_running(&mut sys)? {
+        log::info!("agent wasn't running, launched it");
+    } else {
+        log::info!("agent already running");
+    }
 
     // Must exist before any menu/tray-icon construction: on Linux this is
     // what calls `gtk::init()` under the hood, and building a `Menu` first
@@ -102,15 +125,24 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let mut recording = false;
+    // Set once Quit starts stopping the agent. Poll ticks queued while Quit
+    // blocks on the agent's exit are still delivered afterwards, and without
+    // this the supervisor would see the agent gone and relaunch it.
+    let mut quitting = false;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
+        if quitting {
+            return;
+        }
 
         let menu_event = match event {
             Event::UserEvent(TickEvent::Menu(event)) => Some(event),
             Event::UserEvent(TickEvent::Poll) => {
-                if let Ok(true) = supervisor::ensure_agent_running(&mut sys) {
-                    println!("ghostperf-tray: agent wasn't running, relaunched it");
+                match supervisor::ensure_agent_running(&mut sys) {
+                    Ok(true) => log::warn!("agent wasn't running, relaunched it"),
+                    Ok(false) => {}
+                    Err(e) => log::error!("failed to relaunch agent: {e:#}"),
                 }
 
                 if let Some(now_recording) = agent_port().and_then(ipc_client::is_recording) {
@@ -134,13 +166,25 @@ fn main() -> anyhow::Result<()> {
         let Some(menu_event) = menu_event else { return };
 
         if menu_event.id() == quit_item.id() {
+            // Quit stops the agent too: the tray launches and supervises it,
+            // so a tray-less agent would be left recording with nothing
+            // watching it and no visible way to stop it.
+            quitting = true;
+            let _ = tray.set_tooltip(Some("GhostPerf — shutting down…"));
+            log::info!("quit requested, shutting down agent");
+            match supervisor::shutdown_agent(&mut sys, agent_port()) {
+                Ok(()) => log::info!("agent shut down cleanly; exiting"),
+                Err(e) => log::error!("exiting, but agent shutdown failed: {e:#}"),
+            }
             *control_flow = ControlFlow::Exit;
         } else if menu_event.id() == start_item.id() {
             send_to_agent(agent_port(), "start");
         } else if menu_event.id() == stop_item.id() {
             send_to_agent(agent_port(), "stop");
         } else if menu_event.id() == open_ui_item.id() {
-            let _ = open_ui::open_ui(&mut sys);
+            if let Err(e) = open_ui::open_ui(&mut sys) {
+                log::error!("failed to open UI: {e:#}");
+            }
         } else if menu_event.id() == autostart_item.id() {
             let result = if autostart_item.is_checked() {
                 autostart::enable()
@@ -148,7 +192,7 @@ fn main() -> anyhow::Result<()> {
                 autostart::disable()
             };
             if let Err(e) = result {
-                eprintln!("ghostperf-tray: failed to update autostart: {e}");
+                log::error!("failed to update autostart: {e}");
                 // Reflect reality rather than the toggle the user just made.
                 autostart_item.set_checked(!autostart_item.is_checked());
             }

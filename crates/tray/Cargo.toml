@@ -16,6 +16,8 @@ anyhow = "1"
 # Decodes the embedded fallback tray-icon PNGs (see src/icons.rs). Already in
 # the tree via tray-icon/muda, so this adds nothing new to the build.
 png = "0.18"
+log = "0.4.35"
+logging = { path = "../logging" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

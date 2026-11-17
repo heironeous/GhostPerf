@@ -73,26 +73,33 @@ pub fn run(
                         .map(|id| {
                             current_session = Some((id, started_at));
                             recording_flag.store(true, Ordering::SeqCst);
+                            log::info!("session {id} started (label: {label:?})");
                             id
                         })
                 };
+                if let Err(e) = &result {
+                    log::warn!("start refused: {e:#}");
+                }
                 let _ = reply.send(result);
             }
             Ok(CoreMsg::Stop { reply }) => {
                 let result = if let Some((id, started_at)) = current_session.take() {
                     recording_flag.store(false, Ordering::SeqCst);
-                    let ended_at = now_millis();
-                    if config.eventlog_correlation {
-                        events_buffer.extend(eventlog::correlate(started_at, ended_at));
-                    }
-                    flush(&store, id, &mut buffer, &mut events_buffer);
-                    store
-                        .stop_session(id, ended_at)
-                        .map(|_| Some(id))
-                        .map_err(Into::into)
+                    finish_session(
+                        &store,
+                        &config,
+                        id,
+                        started_at,
+                        &mut buffer,
+                        &mut events_buffer,
+                    )
+                    .map(|_| Some(id))
                 } else {
                     Ok(None)
                 };
+                if let Err(e) = &result {
+                    log::error!("failed to stop session: {e:#}");
+                }
                 let _ = reply.send(result);
             }
             Ok(CoreMsg::Status { reply }) => {
@@ -132,11 +139,23 @@ pub fn run(
                 }
             }
             Ok(CoreMsg::Shutdown) => {
-                if let Some((id, _)) = current_session.take() {
-                    flush(&store, id, &mut buffer, &mut events_buffer);
-                    let _ = store.stop_session(id, now_millis());
-                }
+                log::info!("shutdown requested");
                 recording_flag.store(false, Ordering::SeqCst);
+                if let Some((id, started_at)) = current_session.take() {
+                    if let Err(e) = finish_session(
+                        &store,
+                        &config,
+                        id,
+                        started_at,
+                        &mut buffer,
+                        &mut events_buffer,
+                    ) {
+                        // Nobody is waiting on a reply here, so this is the
+                        // only trace. The session isn't lost either way: the
+                        // next agent start closes it as orphaned.
+                        log::error!("failed to close session {id} on shutdown: {e:#}");
+                    }
+                }
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -183,6 +202,34 @@ fn check_thresholds(
     }
 }
 
+/// Everything that ends a session, shared by an explicit `stop` and by
+/// `shutdown` (the tray's Quit) so the two can't drift apart — they already
+/// did once: shutdown used to skip Event Log correlation, so a session
+/// ended by quitting the tray had none.
+fn finish_session(
+    store: &Store,
+    config: &AgentConfig,
+    id: i64,
+    started_at: i64,
+    buffer: &mut Vec<MetricSample>,
+    events_buffer: &mut Vec<NewEvent>,
+) -> anyhow::Result<()> {
+    let ended_at = now_millis();
+    let mut correlated = 0;
+    if config.eventlog_correlation {
+        let events = eventlog::correlate(started_at, ended_at);
+        correlated = events.len();
+        events_buffer.extend(events);
+    }
+    flush(store, id, buffer, events_buffer);
+    store.stop_session(id, ended_at)?;
+    log::info!(
+        "session {id} stopped after {:.1}s ({correlated} Event Log entries correlated)",
+        (ended_at - started_at) as f64 / 1000.0
+    );
+    Ok(())
+}
+
 fn flush(
     store: &Store,
     session_id: i64,
@@ -191,13 +238,13 @@ fn flush(
 ) {
     if !buffer.is_empty() {
         if let Err(e) = store.insert_metrics_batch(session_id, buffer) {
-            eprintln!("ghostperf-agent: failed to flush metrics batch: {e}");
+            log::error!("failed to flush metrics batch: {e}");
         }
         buffer.clear();
     }
     if !events_buffer.is_empty() {
         if let Err(e) = store.insert_events_batch(session_id, events_buffer) {
-            eprintln!("ghostperf-agent: failed to flush events batch: {e}");
+            log::error!("failed to flush events batch: {e}");
         }
         events_buffer.clear();
     }
@@ -269,6 +316,63 @@ mod tests {
 
         tx.send(CoreMsg::Shutdown).unwrap();
         core.join().unwrap();
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+    }
+
+    /// The tray's Quit sends `shutdown` while a session may still be
+    /// recording: buffered samples and events must reach disk and the
+    /// session must be closed, exactly as an explicit `stop` would.
+    #[test]
+    fn shutdown_while_recording_flushes_and_closes_the_session() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-core-shutdown-test-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ));
+        let store = Store::open(&db_path).unwrap();
+        let config = AgentConfig {
+            flush_batch_size: 10_000, // nothing reaches disk before shutdown
+            flush_interval_ms: 60_000,
+            // Real Event Log contents would make the event count
+            // machine-dependent; correlation itself is covered separately.
+            eventlog_correlation: false,
+            ..AgentConfig::default()
+        };
+
+        let (tx, rx) = channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let core = {
+            let flag = flag.clone();
+            std::thread::spawn(move || run(store, rx, config, flag))
+        };
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Start { label: None, reply }).unwrap();
+        let session_id = reply_rx.recv().unwrap().unwrap();
+        for i in 0..3 {
+            tx.send(CoreMsg::Sample(sample(i))).unwrap();
+        }
+        tx.send(CoreMsg::Event {
+            ts: 1,
+            kind: "stall".into(),
+            value: 60.0,
+            detail: None,
+        })
+        .unwrap();
+
+        tx.send(CoreMsg::Shutdown).unwrap();
+        core.join().unwrap();
+        assert!(!flag.load(Ordering::SeqCst), "sampling should be stopped");
+
+        let reader = Store::open(&db_path).unwrap();
+        let session = reader.get_session(session_id).unwrap().unwrap();
+        assert!(session.ended_at.is_some(), "session left open by shutdown");
+        assert_eq!(reader.metrics_for_session(session_id).unwrap().len(), 3);
+        assert_eq!(reader.events_for_session(session_id).unwrap().len(), 1);
+
         drop(reader);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));

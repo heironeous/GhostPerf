@@ -1,0 +1,10 @@
+[package]
+name = "logging"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Local-time timestamps in log lines. `clock` only, no default features: no
+# serde/formatting extras, just `Local::now()`.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+log = "0.4.35"

@@ -79,6 +79,14 @@ Two gotchas hit while doing this, now fixed but worth knowing if you're debuggin
 - **`sysinfo`'s process scan includes zombies** (dead, unreaped processes) on Linux. Any "is process X still running" check needs to filter `ProcessStatus::Zombie` out, or a crashed-and-not-yet-reaped child looks alive forever. See `crates/tray/src/supervisor.rs` for the fix and why it mattered (it broke crash-relaunch entirely until found).
 - **`tao`'s `ControlFlow::WaitUntil`/`Poll` didn't reliably wake the event loop** in this headless, no-window-manager setup — only `Event::UserEvent` pushed in from a background thread via `EventLoopProxy` did. See `crates/tray/src/main.rs`. Don't revert to a `WaitUntil`-based poll loop without testing it on a real desktop/Windows first.
 
+## Observing the windowless binaries (logs)
+
+On Windows the agent and tray are GUI-subsystem binaries (`#![cfg_attr(windows, windows_subsystem = "windows")]`), so they never print to a console. Their output is in `%APPDATA%\GhostPerf\logs\{agent,tray}.log` (`$TMPDIR/GhostPerf/logs` on Linux). Read those after a smoke test instead of watching a terminal. Two consequences when testing on Windows:
+- **PowerShell doesn't wait for a GUI binary.** `.\ghostperf-agent.exe` returns immediately and `$LASTEXITCODE` is meaningless. Use `Start-Process … -PassThru -Wait` and `.ExitCode`, or pipe the output (`& .\ghostperf-agent.exe | Out-Null`), which makes PowerShell wait.
+- **Log lines are also copied to stderr**, which is discarded when there's no console but shows up when stderr is redirected. So `Start-Process … -RedirectStandardError <file>`, a pipe, or any Linux run still shows everything live.
+
+Use the `log` macros (`log::info!`, `log::warn!`, `log::error!`), never `println!`/`eprintln!`, in non-test code in these binaries, or the output is lost on Windows. Errors that end the process go through `main`'s `log::error!("fatal: …")` and `exit(1)`, not a `Result` returned from `main`, for the same reason.
+
 ## Code conventions
 
 These are patterns established consistently across Phases 1–3 — follow them for consistency rather than inventing a new approach each time.
