@@ -20,6 +20,12 @@ pub fn data_dir() -> PathBuf {
         .join("GhostPerf")
 }
 
+/// Where each binary writes its log file (`agent.log`, `tray.log`, …): the
+/// binaries are windowless, so there's no console to print to.
+pub fn log_dir() -> PathBuf {
+    data_dir().join("logs")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Fields missing from an existing agent.toml (e.g. one written by an older
 // version before a setting existed) fall back to `Default` instead of failing
@@ -96,6 +102,18 @@ impl AgentConfig {
     pub fn default_config_path() -> PathBuf {
         data_dir().join("agent.toml")
     }
+
+    /// Writes this config back to `path` (e.g. after the UI's settings
+    /// screen edits it). Takes effect the next time the agent starts — it
+    /// doesn't watch the file or hot-reload.
+    pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +154,25 @@ retention_days = 30
         let old = "sample_interval_ms = 750\ncontrol_port = 38631\n";
         let cfg: AgentConfig = toml::from_str(old).expect("stale control_port should be ignored");
         assert_eq!(cfg.sample_interval_ms, 750);
+    }
+
+    #[test]
+    fn save_then_load_or_default_roundtrips_edited_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "ghostperf-agent-config-save-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = AgentConfig::default();
+        cfg.sample_interval_ms = 2500;
+        cfg.retention_days = 7;
+        cfg.save(&path).unwrap();
+
+        let loaded = AgentConfig::load_or_default(&path).unwrap();
+        assert_eq!(loaded.sample_interval_ms, 2500);
+        assert_eq!(loaded.retention_days, 7);
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

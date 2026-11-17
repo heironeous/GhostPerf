@@ -36,6 +36,14 @@ apt-get install -y pkg-config libdbus-1-dev libgtk-3-dev libxdo-dev libayatana-a
 apt-get install -y xvfb dbus-x11
 ```
 
+**To actually run (not just build) `crates/ui`**, on top of the above: `eframe`'s default renderer is `wgpu`, which needs a real adapter even on a headless box — a software Vulkan ICD is enough, and `winit` separately needs `libxkbcommon-x11` to create an X11 event loop at all:
+
+```sh
+apt-get install -y mesa-vulkan-drivers libxkbcommon-x11-0
+```
+
+Without `mesa-vulkan-drivers`, `eframe::run_native` fails to find an adapter; without `libxkbcommon-x11-0`, it panics on startup (`Library libxkbcommon-x11.so could not be loaded`) — the panic hook logs this to `ui.log` same as any other panic, which is how it was first diagnosed here. Driving/verifying the UI beyond "it launches" (clicking, dragging, typing) additionally needs `xdotool` (input) and `imagemagick`'s `import` (screenshots of the Xvfb window, since there's nothing else to look at it with) — see the next section.
+
 ## Verifying Windows-only code without a Windows machine
 
 This is the single most important workflow in this repo. Don't skip it for anything touching `#[cfg(target_os = "windows")]` code, a `windows_impl.rs`, or a `build.rs` that embeds resources.
@@ -78,6 +86,29 @@ Two gotchas hit while doing this, now fixed but worth knowing if you're debuggin
 - **`pkill -f <pattern>` can match its own argv** and kill something unintended (including, confusingly, itself) if `<pattern>` appears in the `pkill` invocation's own command line. Use `pkill -x <exact-process-name>` instead when cleaning up test processes.
 - **`sysinfo`'s process scan includes zombies** (dead, unreaped processes) on Linux. Any "is process X still running" check needs to filter `ProcessStatus::Zombie` out, or a crashed-and-not-yet-reaped child looks alive forever. See `crates/tray/src/supervisor.rs` for the fix and why it mattered (it broke crash-relaunch entirely until found).
 - **`tao`'s `ControlFlow::WaitUntil`/`Poll` didn't reliably wake the event loop** in this headless, no-window-manager setup — only `Event::UserEvent` pushed in from a background thread via `EventLoopProxy` did. See `crates/tray/src/main.rs`. Don't revert to a `WaitUntil`-based poll loop without testing it on a real desktop/Windows first.
+
+## Smoke-testing the UI on headless Linux
+
+Unlike the tray, `ghostperf-ui` has a real window, so a screenshot tool and a way to drive input are worth having (neither is needed to just build/run it — only to verify what's actually on screen):
+
+```sh
+apt-get install -y imagemagick xdotool
+```
+
+```sh
+Xvfb :97 -screen 0 1280x1024x24 &
+eval "$(DISPLAY=:97 dbus-launch --sh-syntax)"
+mkdir -p /tmp/xdgrt && chmod 700 /tmp/xdgrt   # silences a winit warning, harmless either way
+XDG_RUNTIME_DIR=/tmp/xdgrt DISPLAY=:97 DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" APPDATA=/tmp/scratch-appdata \
+    ./target/debug/ghostperf-ui &
+WIN=$(DISPLAY=:97 xdotool search --name "GhostPerf" | head -1)
+DISPLAY=:97 xdotool mousemove --window "$WIN" <x> <y> click 1   # drive it like a user would
+DISPLAY=:97 import -window "$WIN" /tmp/shot.png                  # then look
+```
+
+Two things that aren't bugs, just this environment:
+- **`xdotool type`/`key` need the window focused first**, and there's no window manager here to do that on click — `xdotool windowfocus "$WIN"` before typing. `windowactivate` logs a harmless `_NET_ACTIVE_WINDOW` warning and can be skipped.
+- **A single `xdotool mousedown`/`mousemove`/`mouseup` without intermediate steps can collapse a drag to one point** (egui_plot's `dragged()` reads the pointer position once per rendered frame, and X can coalesce a fast synthetic drag into too few frames to see it move) — loop a few `xdotool mousemove --sync` calls with short sleeps between down and up when testing a drag gesture (e.g. the detail view's brush-select).
 
 ## Observing the windowless binaries (logs)
 

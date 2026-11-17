@@ -21,6 +21,19 @@ pub struct Session {
     pub host_info: Option<String>,
 }
 
+/// Cheap per-session aggregate stats for a list-view row — see
+/// `Store::session_summary`. `None` fields mean the session has no samples
+/// yet (e.g. started and stopped with nothing recorded in between).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub sample_count: i64,
+    pub avg_cpu_pct: Option<f64>,
+    pub peak_cpu_pct: Option<f64>,
+    pub peak_mem_used_mb: Option<f64>,
+    /// `(kind, count)`, one row per distinct `events.kind` for the session.
+    pub event_counts: Vec<(String, i64)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessSample {
     pub pid: u32,
@@ -345,6 +358,48 @@ impl Store {
         Ok(out)
     }
 
+    pub fn rename_session(&self, session_id: i64, label: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET label = ?1 WHERE id = ?2",
+            params![label, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Cheap aggregate stats for a session's list-view row, computed in SQL
+    /// so the UI doesn't have to load every sample just to show a summary.
+    pub fn session_summary(&self, session_id: i64) -> Result<SessionSummary> {
+        let (sample_count, avg_cpu_pct, peak_cpu_pct, peak_mem_used_mb) = self.conn.query_row(
+            "SELECT COUNT(*), AVG(cpu_pct), MAX(cpu_pct), MAX(mem_used_mb) FROM metrics WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )?;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, COUNT(*) FROM events WHERE session_id = ?1 GROUP BY kind")?;
+        let event_counts = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(SessionSummary {
+            sample_count,
+            avg_cpu_pct,
+            peak_cpu_pct,
+            peak_mem_used_mb,
+            event_counts,
+        })
+    }
+
     pub fn delete_session(&self, session_id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM metrics WHERE session_id = ?1",
@@ -406,6 +461,95 @@ mod tests {
         assert_eq!(metrics[0].top_processes[0].handle_count, Some(200));
         assert_eq!(metrics[0].context_switches_per_sec, 2500.0);
         assert_eq!(metrics[0].gpu_pct, Some(33.0));
+    }
+
+    #[test]
+    fn rename_session_updates_label() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(1000, Some("first"), None).unwrap();
+
+        store.rename_session(id, Some("renamed")).unwrap();
+        assert_eq!(
+            store.get_session(id).unwrap().unwrap().label.as_deref(),
+            Some("renamed")
+        );
+
+        store.rename_session(id, None).unwrap();
+        assert_eq!(store.get_session(id).unwrap().unwrap().label, None);
+    }
+
+    #[test]
+    fn session_summary_aggregates_metrics_and_events() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(1000, None, None).unwrap();
+
+        let sample = |ts: i64, cpu: f32, mem: f32| MetricSample {
+            ts,
+            cpu_pct: cpu,
+            cpu_per_core_pct: vec![cpu],
+            mem_used_mb: mem,
+            mem_available_mb: 1024.0,
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
+            context_switches_per_sec: 0.0,
+            page_faults_per_sec: 0.0,
+            gpu_pct: None,
+            top_processes: Vec::new(),
+        };
+        store
+            .insert_metrics_batch(id, &[sample(1001, 10.0, 100.0), sample(1002, 90.0, 300.0)])
+            .unwrap();
+        store
+            .insert_events_batch(
+                id,
+                &[
+                    NewEvent {
+                        ts: 1002,
+                        kind: "cpu_spike".into(),
+                        value: 90.0,
+                        detail: None,
+                    },
+                    NewEvent {
+                        ts: 1003,
+                        kind: "cpu_spike".into(),
+                        value: 95.0,
+                        detail: None,
+                    },
+                    NewEvent {
+                        ts: 1004,
+                        kind: "stall".into(),
+                        value: 60.0,
+                        detail: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let summary = store.session_summary(id).unwrap();
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(summary.avg_cpu_pct, Some(50.0));
+        assert_eq!(summary.peak_cpu_pct, Some(90.0));
+        assert_eq!(summary.peak_mem_used_mb, Some(300.0));
+        let mut counts = summary.event_counts.clone();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![("cpu_spike".to_string(), 2), ("stall".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn session_summary_of_empty_session_has_none_stats() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(1000, None, None).unwrap();
+        let summary = store.session_summary(id).unwrap();
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.avg_cpu_pct, None);
+        assert_eq!(summary.peak_cpu_pct, None);
+        assert_eq!(summary.peak_mem_used_mb, None);
+        assert!(summary.event_counts.is_empty());
     }
 
     #[test]
