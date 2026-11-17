@@ -138,6 +138,34 @@ One bug the smoke test caught and fixed before landing: scrolling the mouse whee
 
 Not yet verified: a real Windows run (icon/window rendering via a real GPU rather than llvmpipe, and real mouse/keyboard input) — needs the same first-real-run shakeout Phases 1–3 got. The headless Linux test above also couldn't exercise real keyboard focus for typing into a text field without `xdotool windowfocus` workarounds (no window manager in this container, same limitation noted for the tray in Phase 3) — unlikely to matter on a real desktop, which has normal window-manager-driven focus, but untested.
 
+#### First Windows run of Phase 4 (2026-11-17)
+Built with MSVC (`build.ps1 -Test`, release; all 64 tests pass) and run on Windows 11 at 3840×2160, 150% scaling, rendering through wgpu's Vulkan backend on an RTX 3060 Ti. Driven with real Win32 mouse and keyboard input (`SetCursorPos`/`SendInput` from a PowerShell helper, screenshots via `CopyFromScreen`: Windows' equivalent of the xdotool/`import` workflow in `AGENTS.md`), against a database recorded by the real agent, including a 38 s session with an 8 s all-core CPU burst. Every value checked was cross-checked against SQLite.
+
+Verified working on Windows:
+- **Session list:** values match the DB (avg/peak CPU, peak mem, event counts).
+- **Detail charts:** a `cpu_spike` marker sits at the 100% sample on all 4 charts.
+- **Zoom and pan:** right-drag box-zoom is linked across the charts, double-click resets them all, the linked hover cursor works, and the mouse wheel scrolls the page instead of panning charts.
+- **Brush-select:** 15.0–20.0 s on the overview strip recomputes the process table to exactly the DB-derived values for that window.
+- **Per-process table:** values are normalized to whole-machine scale. A process pegging one core shows 5.0% on 20 cores, matching the DB.
+- **Rename:** in the detail header and inline in the list (Enter commits). Keyboard focus and typing work normally, which the headless Linux run couldn't confirm.
+- **Delete:** two-step confirm, with Cancel placed where Delete was. A confirmed delete removes the session plus its metrics and events.
+- **Export:** CSV and JSON both export complete and correct data (35/35 rows, all 13 columns; JSON has session, metrics and events).
+- **Settings:** saving writes `agent.toml`.
+- **Health:** no WARN, ERROR or panic in `ui.log`. Idle CPU is 0.3% of one core, since egui repaints only on input.
+
+Found, not yet fixed:
+- [ ] **Choosing JSON export overwrites the CSV export.** The CSV/JSON radio only flips `export_as_json`, and the path keeps its default `session-<id>.csv`, so a JSON export is written to `session-<id>.csv`, silently replacing an earlier CSV export (`crates/ui/src/views/session_detail.rs`, `export_controls`). Fix: swap the extension when the format changes, if the path still ends in the other format's extension.
+- [ ] **Export result is shown at the top of the page, far from the Export button.** `self.status` is drawn under the header (`session_detail.rs`, in `ui()`), while Export sits at the bottom, below the process table. The "Exported to …" message is off-screen when you click Export, and inserting it pushes the whole page down ~30 px, so a second click aimed at the CSV/JSON radios lands elsewhere. Fix: show export status in the export row.
+- [ ] **The 4 charts' plot areas aren't horizontally aligned.** Each `egui_plot` sizes its y-axis to its own labels ("100" vs "20000000"), so the same timestamp is drawn at a different x on each chart. Measured: one `cpu_spike` marker at x = 820/831/848/837 px full-range, and 697/725/745/731 px zoomed to 14–22 s, where the "17 s" tick spans 616–668 px. That defeats reading across the charts. Fix: give all 4 plots (and the overview strip) the same `y_axis_min_width`.
+- [ ] **Smaller UI issues:**
+  - Y-axis values are raw bytes/s (`20000000`) rather than scaled KB/MB.
+  - After a box-zoom the CPU chart's y-axis labels disappear.
+  - The overview strip zooms along with the charts because it's in the same link group, so after zooming you can only brush within the zoomed range.
+  - In the session list, a row in delete-confirm state shifts its stat columns ~165 px left of their headers.
+- [ ] **The tray costs ~1.4% of one core while idle** (measured over 10 s; ~0.07% of this 20-core machine), most likely from `supervisor::is_agent_running` refreshing every process on the system once a second. Not a Phase 4 issue; relevant to Phase 5's resource-usage self-check.
+
+Not verified on Windows: "Open UI" from the tray menu (tray menu clicks are still manual-only, see Phase 3), and behavior at 100%/other DPI scalings or on a second monitor.
+
 ### Phase 5 — Packaging & polish
 - [ ] Single installer (MSI/NSIS) that installs agent + tray + UI and registers autostart
 - [ ] Portable version: a zip of the three binaries that runs with no installer, no registry entries, and no autostart — config/DB default to a path next to the executable instead of `%APPDATA%` (likely needs a `--portable` flag or auto-detection so the installed and portable builds can share the same binaries)
