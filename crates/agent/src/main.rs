@@ -1,5 +1,6 @@
 mod core;
 mod eventlog;
+mod instance;
 mod ipc;
 mod platform;
 mod sampler;
@@ -24,25 +25,43 @@ pub fn now_millis() -> i64 {
 fn main() -> anyhow::Result<()> {
     let config_path = AgentConfig::default_config_path();
     let config = AgentConfig::load_or_default(&config_path)?;
-    println!(
-        "ghostperf-agent: db={} control_port={} sample_interval_ms={}",
-        config.db_path.display(),
-        config.control_port,
-        config.sample_interval_ms
-    );
+
+    // Must come before opening the store: a second agent would otherwise
+    // close the first one's in-progress session as "orphaned" below.
+    let lock_path = agent_config::data_dir().join("agent.lock");
+    let Some(_instance_lock) = instance::acquire(&lock_path)
+        .with_context(|| format!("failed to open instance lock {}", lock_path.display()))?
+    else {
+        let port_file = agent_config::port_file_path();
+        let port = agent_config::read_port_file(&port_file)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        println!(
+            "ghostperf-agent: another agent is already running (control port {port}, per {}); exiting",
+            port_file.display()
+        );
+        return Ok(());
+    };
 
     // Bind the control socket before anything else and fail hard if it's
     // unavailable: without it the agent can't be started or stopped, and
     // previously it would keep running silently in that useless state.
-    let listener = ipc::bind(config.control_port).with_context(|| {
+    let listener = ipc::bind().context("failed to bind a loopback control port")?;
+    let control_port = listener.local_addr()?.port();
+    let port_file = agent_config::port_file_path();
+    agent_config::write_port_file(&port_file, control_port).with_context(|| {
         format!(
-            "failed to bind control port 127.0.0.1:{} — another agent may already be running, \
-             or the port is reserved by Windows (check `netsh int ipv4 show excludedportrange \
-             protocol=tcp`). Change `control_port` in {}",
-            config.control_port,
-            config_path.display()
+            "failed to write control port to {} — clients couldn't find this agent",
+            port_file.display()
         )
     })?;
+    println!(
+        "ghostperf-agent: db={} control_port={} (written to {}) sample_interval_ms={}",
+        config.db_path.display(),
+        control_port,
+        port_file.display(),
+        config.sample_interval_ms
+    );
 
     let store = Store::open(&config.db_path)?;
     let closed = store.close_orphaned_sessions(now_millis())?;
@@ -96,5 +115,14 @@ fn main() -> anyhow::Result<()> {
     // (after a CoreMsg::Shutdown), there's nothing left to keep the process
     // alive for, so exit instead of leaking the sampler/ipc threads.
     let _ = core_handle.join();
+    // Lets clients see "not running" immediately instead of timing out
+    // against a dead port. Safe to delete unconditionally: we still hold the
+    // instance lock, so no other agent can have written it since.
+    if let Err(e) = agent_config::remove_port_file(&port_file) {
+        eprintln!(
+            "ghostperf-agent: failed to remove {}: {e}",
+            port_file.display()
+        );
+    }
     Ok(())
 }

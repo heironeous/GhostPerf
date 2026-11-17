@@ -1,15 +1,32 @@
-//! `AgentConfig` and the `agent.toml` load/default path, split out of the
-//! `agent` crate so other processes (the tray) can read the same config
-//! file — in particular `control_port` — without duplicating the format or
-//! its defaulting rules.
+//! `AgentConfig`, the `agent.toml` load/default path, and the agent's
+//! runtime control-port file — split out of the `agent` crate so other
+//! processes (the tray, later the UI) agree on where these live and how
+//! they're formatted without duplicating that logic.
+
+mod control_port;
+
+pub use control_port::{port_file_path, read_port_file, remove_port_file, write_port_file};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Directory holding `agent.toml`, the default database, and the agent's
+/// runtime files (`agent.port`, `agent.lock`). `%APPDATA%` doesn't exist on
+/// non-Windows dev builds, so those fall back to the OS temp dir.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("GhostPerf")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Fields missing from an existing agent.toml (e.g. one written by an older
 // version before a setting existed) fall back to `Default` instead of failing
-// to parse and stopping the agent from starting.
+// to parse and stopping the agent from starting. Unknown fields are ignored
+// rather than rejected (no `deny_unknown_fields`) for the same reason in
+// reverse: settings that have since been removed, like `control_port`, may
+// still be sitting in an older file.
 #[serde(default)]
 pub struct AgentConfig {
     /// How often to sample metrics while a session is recording.
@@ -22,8 +39,6 @@ pub struct AgentConfig {
     /// Number of top CPU-consuming processes to snapshot each sample.
     pub top_n_processes: usize,
     pub db_path: PathBuf,
-    /// Loopback-only TCP port used for the local start/stop/status control channel.
-    pub control_port: u16,
     /// How many days of completed sessions to retain before auto-pruning.
     pub retention_days: u32,
     /// How often the stall detector's timing thread wakes up and measures
@@ -51,12 +66,7 @@ impl Default for AgentConfig {
             flush_batch_size: 30,
             flush_interval_ms: 10_000,
             top_n_processes: 5,
-            db_path: default_db_path(),
-            // Kept below 44620: on some Windows machines (WSL/Hyper-V/VPN
-            // drivers) a block of loopback ports from 44620 to 48715 is held
-            // without appearing in `excludedportrange`, and the old default
-            // 47631 fell inside it.
-            control_port: 38631,
+            db_path: data_dir().join("ghostperf.db"),
             retention_days: 30,
             stall_check_interval_ms: 15,
             stall_threshold_ms: 50,
@@ -65,13 +75,6 @@ impl Default for AgentConfig {
             eventlog_correlation: true,
         }
     }
-}
-
-fn default_db_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("GhostPerf").join("ghostperf.db")
 }
 
 impl AgentConfig {
@@ -91,10 +94,7 @@ impl AgentConfig {
     }
 
     pub fn default_config_path() -> PathBuf {
-        let base = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        base.join("GhostPerf").join("agent.toml")
+        data_dir().join("agent.toml")
     }
 }
 
@@ -117,7 +117,6 @@ retention_days = 30
         let cfg: AgentConfig = toml::from_str(old).expect("old config should still parse");
         let defaults = AgentConfig::default();
         assert_eq!(cfg.sample_interval_ms, 500);
-        assert_eq!(cfg.control_port, 40000);
         assert_eq!(
             cfg.stall_check_interval_ms,
             defaults.stall_check_interval_ms
@@ -128,5 +127,14 @@ retention_days = 30
             defaults.cpu_spike_threshold_pct
         );
         assert_eq!(cfg.eventlog_correlation, defaults.eventlog_correlation);
+    }
+
+    #[test]
+    fn config_with_removed_control_port_field_still_loads() {
+        // Every agent.toml auto-created before the control port became
+        // OS-assigned has this line; it must be ignored, not fatal.
+        let old = "sample_interval_ms = 750\ncontrol_port = 38631\n";
+        let cfg: AgentConfig = toml::from_str(old).expect("stale control_port should be ignored");
+        assert_eq!(cfg.sample_interval_ms, 750);
     }
 }

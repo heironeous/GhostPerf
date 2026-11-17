@@ -15,7 +15,7 @@ Three separate binaries, one shared storage format, talking over a local IPC cha
 
 ### IPC
 
-- Tray ↔ Agent: loopback-only TCP socket (`127.0.0.1:38631`, configurable via `control_port`), one newline-terminated text command per connection (`start [label]`, `stop`, `status`, `shutdown`). Chosen over a named pipe for implementation simplicity — identical code on Windows/Linux, no extra crate, still same-machine-only.
+- Tray ↔ Agent: loopback-only TCP socket on an OS-assigned port (agent binds `127.0.0.1:0` at startup and publishes the port in `%APPDATA%\GhostPerf\agent.port`; clients re-read it on every connect, since it changes on each agent start — see `crates/agent_config/src/control_port.rs`), one newline-terminated text command per connection (`start [label]`, `stop`, `status`, `shutdown`). Chosen over a named pipe for implementation simplicity — identical code on Windows/Linux, no extra crate, still same-machine-only.
 - Tray → UI: spawn UI process directly (UI reads SQLite DB directly, read-only — no need to proxy through the agent).
 
 ### Data model (SQLite)
@@ -54,6 +54,12 @@ Smoke-tested on Windows 11: release build, agent started, session started over t
 - [x] **Agent kept running silently when the control port couldn't be bound.** The bind happened inside the IPC thread, which only logged to stderr and exited, leaving an agent that could never be told to start recording. The socket is now bound on the main thread before startup, and failure exits with code 1 and a message naming the port and config file (`crates/agent/src/main.rs`, `crates/agent/src/ipc.rs`).
 - [x] **Time-based flush never fired while recording.** The flush relied on `recv_timeout(flush_interval)`, which only times out after a full interval with no messages, but samples arrive every second. Data reached disk only in 30-sample batches, so a crash could lose up to ~29 s. The flush is now deadline-based and checked after every message (`crates/agent/src/core.rs`). Regression test: `core::tests::time_based_flush_fires_while_samples_keep_arriving`.
 
+#### Found reviewing a real Windows recording (2026-11-17)
+A session recorded from the tray on Windows 11 (20 logical cores) was checked sample by sample: no gaps, no NULLs, every value in range, mem used + available constant. The data is correct, but the review turned up two open issues:
+
+- [ ] **Per-process `cpu_pct` uses a different scale from the system-wide `cpu_pct`.** `ProcessSample::cpu_pct` stores `sysinfo`'s `Process::cpu_usage()`, where 100% means one full core, so it can exceed 100%. `MetricSample::cpu_pct` stores `global_cpu_usage()`, where 100% means the whole machine (`crates/agent/src/sampler.rs`). Seen: `Code.exe` at 111.2% while the system total was 24.1%; on 20 cores that's about 5.6% of the machine. Nothing is lost, but anything comparing or charting the two together will mislead. Decide on one convention before Phase 4 reads this data: either divide by the logical core count at sample time (that changes the meaning of already-stored rows, so record the convention or a schema version), or keep per-core semantics and have the UI label or normalize it.
+- [ ] **The sampling loop drifts about 4.5% slow.** The sampler thread does `sleep(sample_interval)` and then `sample()` (`crates/agent/src/main.rs`), so each tick takes the interval plus however long sampling takes (the process scan, PDH collection, and the per-process handle/thread lookups). Seen: median gap 1.045 s (range 1.021–1.362 s), so a 41.0 s session produced 39 samples instead of 41. The drift grows with the number of processes running and with `top_n_processes`. Fix by sleeping until a fixed deadline (`next += interval`, sleeping `next - now`), skipping missed ticks rather than bursting to catch up after a stall. Regression test: assert the sample count over N intervals with an artificially slow `sample()`.
+
 ### Phase 2 — Intermittent-issue detection
 - [x] `events` table (`crates/storage`): `(id, session_id, ts, kind, value, detail)`, indexed on `(session_id, ts)` — annotations live alongside `metrics`, not mixed into it
 - [x] High-resolution stall/hang detector — dedicated thread (`crates/agent/src/stall.rs`) sleeps for `stall_check_interval_ms` (default 15ms) and records a `stall` event when it wakes up more than `stall_threshold_ms` (default 50ms) late
@@ -86,7 +92,7 @@ Observed: `thread::sleep` wakeup jitter on Windows 11 maxed at ~0.7 ms over 220 
 - [x] Autostart with Windows (optional toggle) — `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`crates/tray/src/autostart/`)
 - [x] Agent process supervision (launch agent if not running; detect crashes) — scans for a `ghostperf-agent` process by name once a second and relaunches if it's gone (`crates/tray/src/supervisor.rs`)
 
-Pulled `AgentConfig` out of `agent` into a new `agent_config` crate (`crates/agent_config`) so the tray can read `control_port` from the same `agent.toml` without duplicating the config format or its defaulting rules.
+Pulled `AgentConfig` out of `agent` into a new `agent_config` crate (`crates/agent_config`) so the tray can read `control_port` from the same `agent.toml` without duplicating the config format or its defaulting rules. (`control_port` has since been removed — see the first-Windows-run fixes below — and the crate now owns the `agent.port` file location/format instead.)
 
 Architecture note: `main.rs` pushes both the 1-second poll and `muda`'s menu-click events into the `tao` event loop through an `EventLoopProxy` (a `TickEvent::{Poll, Menu}` user event), rather than having the loop itself poll on `ControlFlow::WaitUntil`/`Poll`. This is both the idiomatic way tray-icon examples integrate a background timer with a `tao` loop, and a fix for something found during smoke-testing below.
 
@@ -99,6 +105,15 @@ Smoke-tested end-to-end on Linux (dev environment, headless: `Xvfb` + `dbus-laun
 
 Not yet run on real Windows (needs the same first-real-run shakeout the agent got in Phase 1/2): the registry autostart (`crates/tray/src/autostart/windows_impl.rs`) is only compile-checked, via `cargo check --target x86_64-pc-windows-gnu` (this container has no MSVC `lib.exe` to check the `msvc` triple — see the Phase 2 note on this). Tray-icon rendering and click handling on real Windows is also unverified beyond compilation; this container's headless Linux smoke test exercises the supervision/IPC/autostart-file logic but not an actual visible tray icon or a real mouse click on a menu item.
 
+#### Fixes from first Windows run of Phase 3 (2026-11-17)
+Built with MSVC (`build.ps1 -Test`, release) on Windows 11 and ran the tray, with its stdout redirected to a log to observe supervision: the tray launched the agent, a session was recorded and stopped over the control channel, and a force-killed agent was relaunched exactly once, on a new port. That run found:
+
+- [x] **The tray respawned the agent every second, forever.** On Windows `sysinfo` reports the process name with its `.exe` suffix (`ghostperf-agent.exe`), and the supervisor compared it against the bare `ghostperf-agent`, so it never saw the running agent. Each tick it spawned a duplicate, which died on `os error 10048` binding the fixed control port (the only thing keeping duplicates from piling up). Same bug in "Open UI"'s already-running check. The Linux smoke test couldn't catch it: Linux process names have no extension. Both now go through `paths::is_process_named`, which strips a case-insensitive `.exe` (`crates/tray/src/paths.rs`; tests in its `tests` module).
+- [x] **Fixed control port replaced by an OS-assigned one.** This is the second fixed-port failure (after Phase 1's hidden 44620–48715 reservation), and a fixed port also races on restart with the previous agent's not-yet-released socket. `control_port` is gone from `AgentConfig`. The agent binds `127.0.0.1:0` and writes the port to `agent.port` in the data dir, deleting it on clean shutdown (`crates/agent/src/main.rs`, `crates/agent_config/src/control_port.rs`). The tray re-reads it on every poll/click (`crates/tray/src/main.rs`). Old `agent.toml` files still containing `control_port` load fine because unknown fields are ignored. Regression test: `config_with_removed_control_port_field_still_loads`.
+- [x] **Single-instance guard, needed because of the above.** The fixed port's bind failure had been the only thing stopping a second agent, which is harmful rather than just wasteful: on startup it runs `close_orphaned_sessions`, which would close the first agent's in-progress session. The agent now takes an exclusive `File::try_lock` on `agent.lock` before opening the store. The OS releases the lock on any exit, crash included, and a second agent prints the running agent's port and exits 0 (`crates/agent/src/instance.rs`; test `second_acquire_fails_until_first_is_released`). Verified by launching a second agent by hand alongside a running one.
+
+Still unverified on Windows: icon rendering/state swap and real menu clicks (left to manual testing), and the registry autostart toggle.
+
 ### Phase 4 — UI
 - [ ] Rust project scaffold for UI (`ui/`), `egui`/`eframe` app
 - [ ] Read-only SQLite access layer (list sessions, fetch metrics for a session)
@@ -106,7 +121,7 @@ Not yet run on real Windows (needs the same first-real-run shakeout the agent go
 - [ ] Session detail view: time-series charts (CPU, mem, disk, net) over the session window
 - [ ] Zoom/pan on charts; brush-select a time range for detail
 - [ ] Highlight flagged spikes/stalls on the timeline
-- [ ] Per-process breakdown view within a session
+- [ ] Per-process breakdown view within a session. Per-process `cpu_pct` is currently per-core (can exceed 100%) while the total is whole-machine; resolve the Phase 1 open item on this before charting the two together.
 - [ ] Rename/delete/export session
 - [ ] Export session data (CSV/JSON) for external analysis
 - [ ] Basic settings screen (sample interval, retention/cleanup policy, DB location)

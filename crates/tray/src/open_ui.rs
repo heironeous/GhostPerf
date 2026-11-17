@@ -9,7 +9,7 @@ use std::process::Command;
 
 use sysinfo::{ProcessStatus, System};
 
-use crate::paths::sibling_exe;
+use crate::paths::{is_process_named, sibling_exe};
 
 const UI_PROCESS_NAME: &str = "ghostperf-ui";
 
@@ -17,10 +17,7 @@ pub fn open_ui(sys: &mut System) -> anyhow::Result<()> {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
     // See `supervisor::is_agent_running` for why zombies are excluded.
     let already_running = sys.processes().values().any(|p| {
-        p.status() != ProcessStatus::Zombie
-            && p.name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(UI_PROCESS_NAME)
+        p.status() != ProcessStatus::Zombie && is_process_named(p.name(), UI_PROCESS_NAME)
     });
     if already_running {
         return Ok(());

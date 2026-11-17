@@ -16,7 +16,7 @@ Three binaries, one shared storage format, talking over a local loopback TCP con
 | `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI". |
 | `crates/ui` | `ghostperf-ui` | Session viewer (not implemented yet — Phase 4). |
 | `crates/storage` | (lib) | SQLite schema + queries, shared by `agent` and (eventually) `ui`. |
-| `crates/agent_config` | (lib) | `AgentConfig` and the `agent.toml` load/default logic, shared by `agent` and `tray` so both agree on things like the control port without duplicating the format. |
+| `crates/agent_config` | (lib) | `AgentConfig` and the `agent.toml` load/default logic, plus the `agent.port` file the agent advertises its control port in — shared by `agent` and `tray` (and later `ui`) so all agree on these without duplicating the format. |
 
 See [`TODO.md`](TODO.md) for the full architecture write-up (data model, IPC protocol, why each language/library choice was made) and [`assets/README.md`](assets/README.md) for the icon/branding assets and how to regenerate them.
 
@@ -50,11 +50,14 @@ On Linux, building `crates/tray` pulls in `tray-icon`/`tao`'s GTK backend and ne
 
 Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does). The SQLite database defaults to `%APPDATA%\GhostPerf\ghostperf.db`. On non-Windows dev builds, both default under the OS temp dir instead, since `%APPDATA%` doesn't exist.
 
-The agent also exposes a plain-text control protocol on a loopback TCP port (`control_port` in the config, default `38631`): one newline-terminated command per connection (`start [label]`, `stop`, `status`, `shutdown`), one line of reply. This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
+The agent also exposes a plain-text control protocol on a loopback TCP port: one newline-terminated command per connection (`start [label]`, `stop`, `status`, `shutdown`), one line of reply. The port isn't configurable: the OS assigns a free one each time the agent starts, and the agent writes it to `agent.port` next to `agent.toml` (deleted again on clean shutdown). This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
 
 ```sh
-echo "status" | timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/38631; cat >&3; cat <&3'
+PORT=$(cat "$APPDATA/GhostPerf/agent.port")   # on Linux dev builds: $TMPDIR/GhostPerf, usually /tmp/GhostPerf
+echo "status" | timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT; cat >&3; cat <&3"
 ```
+
+Only one agent runs at a time: each one takes an exclusive lock on `agent.lock` (same directory) at startup, and a second one prints which port the running agent is on and exits.
 
 ## Testing
 

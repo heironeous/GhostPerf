@@ -4,11 +4,13 @@ use std::sync::mpsc::{channel, Sender};
 
 use crate::core::CoreMsg;
 
-/// Binds the loopback-only control socket. Kept separate from `serve` so the
-/// caller can bind on the main thread and treat failure as fatal — an agent
-/// with no control channel can never be told to start recording.
-pub fn bind(port: u16) -> std::io::Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", port))
+/// Binds the loopback-only control socket on an OS-assigned free port (see
+/// `agent_config::control_port` for why the port isn't fixed). Kept
+/// separate from `serve` so the caller can bind on the main thread and treat
+/// failure as fatal — an agent with no control channel can never be told to
+/// start recording.
+pub fn bind() -> std::io::Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", 0))
 }
 
 /// Loopback-only control server. Accepts one newline-terminated command per

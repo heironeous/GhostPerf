@@ -8,7 +8,7 @@ use std::process::Command;
 
 use sysinfo::{ProcessStatus, System};
 
-use crate::paths::sibling_exe;
+use crate::paths::{is_process_named, sibling_exe};
 
 const AGENT_PROCESS_NAME: &str = "ghostperf-agent";
 
@@ -19,10 +19,7 @@ pub fn is_agent_running(sys: &mut System) -> bool {
         // collected yet — on Linux dev machines that's common enough (a
         // shell backgrounding a child it never `wait()`s on) to otherwise
         // make this permanently think a crashed agent is still up.
-        p.status() != ProcessStatus::Zombie
-            && p.name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(AGENT_PROCESS_NAME)
+        p.status() != ProcessStatus::Zombie && is_process_named(p.name(), AGENT_PROCESS_NAME)
     })
 }
 

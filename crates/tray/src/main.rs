@@ -7,7 +7,6 @@ mod supervisor;
 
 use std::time::Duration;
 
-use agent_config::AgentConfig;
 use sysinfo::System;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -33,9 +32,26 @@ enum TickEvent {
     Menu(MenuEvent),
 }
 
+/// Menu-click commands are fire-and-forget (the next poll reflects the
+/// result in the icon), but a failure is logged rather than silently
+/// dropped so a click that did nothing can be diagnosed.
+fn send_to_agent(port: Option<u16>, command: &str) {
+    let Some(port) = port else {
+        eprintln!(
+            "ghostperf-tray: '{command}' not sent — agent hasn't published a control port yet"
+        );
+        return;
+    };
+    if let Err(e) = ipc_client::send_command(port, command) {
+        eprintln!("ghostperf-tray: '{command}' to agent on port {port} failed: {e}");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    let config = AgentConfig::load_or_default(AgentConfig::default_config_path())?;
-    let control_port = config.control_port;
+    // Re-read on every use, never cached: the agent picks a new port each
+    // time it starts, including every crash-relaunch below.
+    let port_file = agent_config::port_file_path();
+    let agent_port = move || agent_config::read_port_file(&port_file);
 
     let mut sys = System::new();
     supervisor::ensure_agent_running(&mut sys)?;
@@ -97,7 +113,7 @@ fn main() -> anyhow::Result<()> {
                     println!("ghostperf-tray: agent wasn't running, relaunched it");
                 }
 
-                if let Some(now_recording) = ipc_client::is_recording(control_port) {
+                if let Some(now_recording) = agent_port().and_then(ipc_client::is_recording) {
                     if now_recording != recording {
                         recording = now_recording;
                         start_item.set_enabled(!recording);
@@ -120,9 +136,9 @@ fn main() -> anyhow::Result<()> {
         if menu_event.id() == quit_item.id() {
             *control_flow = ControlFlow::Exit;
         } else if menu_event.id() == start_item.id() {
-            let _ = ipc_client::send_command(control_port, "start");
+            send_to_agent(agent_port(), "start");
         } else if menu_event.id() == stop_item.id() {
-            let _ = ipc_client::send_command(control_port, "stop");
+            send_to_agent(agent_port(), "stop");
         } else if menu_event.id() == open_ui_item.id() {
             let _ = open_ui::open_ui(&mut sys);
         } else if menu_event.id() == autostart_item.id() {

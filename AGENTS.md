@@ -88,7 +88,7 @@ These are patterns established consistently across Phases 1–3 — follow them 
 - **New Cargo dependencies**: use `cargo add`, not hand-edited `Cargo.toml` entries, so version/feature resolution is correct. Windows-only dependencies go under `[target.'cfg(windows)'.dependencies]` (see `crates/agent/Cargo.toml`, `crates/tray/Cargo.toml`).
 - **Comments explain WHY, not WHAT** — a hidden constraint, a prior incident, a platform quirk, a reason an alternative was rejected. No comment restates what a well-named function already says.
 - **`cargo fmt`** before calling anything done. No custom `rustfmt.toml`; defaults.
-- **Don't duplicate config/state across crates.** When a second binary needed to read the agent's config (the tray needing `control_port`), the fix was extracting a shared `agent_config` lib crate (Phase 3), not re-parsing `agent.toml` independently.
+- **Don't duplicate config/state across crates.** When a second binary needed to read the agent's config (the tray needing what was then `control_port`; it now reads the `agent.port` runtime file through the same crate), the fix was extracting a shared `agent_config` lib crate (Phase 3), not re-parsing `agent.toml` independently.
 
 ## Documentation conventions
 
