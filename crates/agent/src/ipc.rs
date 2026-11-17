@@ -24,11 +24,11 @@ pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>) {
                 let core_tx = core_tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_connection(stream, core_tx) {
-                        eprintln!("ghostperf-agent: ipc connection error: {e}");
+                        log::warn!("connection error: {e}");
                     }
                 });
             }
-            Err(e) => eprintln!("ghostperf-agent: ipc accept error: {e}"),
+            Err(e) => log::warn!("accept error: {e}"),
         }
     }
 }
