@@ -83,7 +83,7 @@ This is how the PDH counters (Phase 2), the registry autostart (Phase 3), and th
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc cargo build --workspace --release --target x86_64-pc-windows-gnu
 ```
 
-This produces real `target/x86_64-pc-windows-gnu/release/ghostperf-{agent,tray,ui}.exe` — genuine PE executables (confirm with the `MZ`/`PE\0\0` header check, or `objdump -p` for the subsystem/resource directory) that just can't be *run* here. Two things this unlocks:
+This produces real `target/x86_64-pc-windows-gnu/release/ghostperf-{agent,tray,ui,overlay}.exe` — genuine PE executables (confirm with the `MZ`/`PE\0\0` header check, or `objdump -p` for the subsystem/resource directory) that just can't be *run* here. Two things this unlocks:
 
 - **Building the installer for real**, not just checking the `.nsi` syntax: `makensis` needs the exes to exist at compile time (`File` embeds them), so point it at a `target/release/` that actually has them — e.g. `cp target/x86_64-pc-windows-gnu/release/*.exe target/release/` first, matching the layout `build.ps1 -Package` expects on a real Windows build. Then `makensis -INPUTCHARSET UTF8 -DPRODUCT_VERSION=x.y.z installer/ghostperf.nsi` (note: `-`, not `/`, on this Linux build of NSIS; both work on Windows. `INPUTCHARSET UTF8` matches what `build.ps1` passes: the script is UTF-8, and without it any non-ASCII string is mis-decoded) produces a real `GhostPerf-Setup-x.y.z.exe`, checkable the same way as the other exes. This is strictly more verification than a syntax check — a script with a wrong path or a missing file fails here exactly like it would on Windows.
 - **Exercising agent-only features against the real binary** instead of only `cargo test`: copy `ghostperf-agent` somewhere and run it directly (`APPDATA=/tmp/scratch ./ghostperf-agent`) to smoke-test things like portable-mode detection (create a `data` folder next to the copied exe first) or crash recovery (`kill -9` it mid-session, restart, check the log and the DB) against the actual release artifact, not just the logic in isolation.
@@ -130,6 +130,18 @@ DISPLAY=:97 import -window "$WIN" /tmp/shot.png                  # then look
 Two things that aren't bugs, just this environment:
 - **`xdotool type`/`key` need the window focused first**, and there's no window manager here to do that on click — `xdotool windowfocus "$WIN"` before typing. `windowactivate` logs a harmless `_NET_ACTIVE_WINDOW` warning and can be skipped.
 - **A single `xdotool mousedown`/`mousemove`/`mouseup` without intermediate steps can collapse a drag to one point** (egui_plot's `dragged()` reads the pointer position once per rendered frame, and X can coalesce a fast synthetic drag into too few frames to see it move) — loop a few `xdotool mousemove --sync` calls with short sleeps between down and up when testing a drag gesture (e.g. the detail view's brush-select).
+
+## Smoke-testing the overlay on headless Linux
+
+Same setup as the UI's section just above (`mesa-vulkan-drivers`, `libxkbcommon-x11-0`, a running agent, `Xvfb`) — `ghostperf-overlay` is `eframe`/`egui` too. Two things specific to this one:
+
+- **Transparency needs a real compositor to actually blend, which this headless setup (`Xvfb`, no window manager at all) doesn't have.** A screenshot of the real window is empty even though it's genuinely rendering (confirmed by temporarily flipping `with_transparent(true)` to `false` in `app.rs::viewport`, rebuilding, and screenshotting again — the CPU/RAM/GPU text showed up fine). Don't read "empty screenshot" here as "broken"; it just can't confirm or rule out the real (opaque-capable) case either way. Revert the flip before committing anything — it was a one-line diagnostic, not a real change.
+- **The global hotkey can be tested for real, not just by calling Rust functions**, and doesn't need the window focused — `global_hotkey`'s X11 backend uses `XGrabKey`, which fires regardless:
+  ```sh
+  DISPLAY=:97 xdotool key --clearmodifiers ctrl+alt+o
+  tail -f "$APPDATA/GhostPerf/logs/overlay.log"   # "hotkey toggled overlay hidden/visible"
+  ```
+- Window position is checkable for real too: `xdotool getwindowgeometry "$WIN"` against the monitor size Xvfb was started with and `OverlayConfig`'s `corner`/`margin_px` — this is what first confirmed `app.rs::corner_position`'s math against a real X server, not just its unit tests.
 
 ## Observing the windowless binaries (logs)
 

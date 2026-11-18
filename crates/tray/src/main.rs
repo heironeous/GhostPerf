@@ -7,6 +7,7 @@ mod autostart;
 mod icons;
 mod ipc_client;
 mod open_ui;
+mod overlay;
 mod paths;
 mod supervisor;
 mod welcome;
@@ -115,6 +116,8 @@ fn run() -> anyhow::Result<()> {
     let start_item = MenuItem::new("Start recording", true, None);
     let stop_item = MenuItem::new("Stop recording", false, None);
     let open_ui_item = MenuItem::new("Open UI", true, None);
+    let overlay_item = MenuItem::new("Show Overlay", true, None);
+    let mut overlay = overlay::OverlayHandle::new();
     let autostart_on = autostart::is_enabled().unwrap_or(false);
     let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart_on, None);
     // A portable copy is meant to leave nothing behind on the machine, and
@@ -130,6 +133,7 @@ fn run() -> anyhow::Result<()> {
     menu.append(&stop_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&open_ui_item)?;
+    menu.append(&overlay_item)?;
     if offer_autostart {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&autostart_item)?;
@@ -195,6 +199,17 @@ fn run() -> anyhow::Result<()> {
                         let _ = tray.set_icon(Some(icon));
                     }
                 }
+
+                // Catches the overlay exiting on its own (e.g. a crash),
+                // not just toggles through this menu. `is_running` is a
+                // non-blocking `Child::try_wait`, not a process scan — see
+                // overlay.rs's module doc for why that's fine to do every
+                // poll tick, unlike the agent/UI checks above.
+                overlay_item.set_text(if overlay.is_running() {
+                    "Hide Overlay"
+                } else {
+                    "Show Overlay"
+                });
                 None
             }
             _ => None,
@@ -205,10 +220,18 @@ fn run() -> anyhow::Result<()> {
         if menu_event.id() == quit_item.id() {
             // Quit stops the agent too: the tray launches and supervises it,
             // so a tray-less agent would be left recording with nothing
-            // watching it and no visible way to stop it.
+            // watching it and no visible way to stop it. Same for the
+            // overlay, if it's running — nothing else would ever stop it,
+            // since it's click-through and has no menu or window of its
+            // own.
             quitting = true;
             let _ = tray.set_tooltip(Some("GhostPerf — shutting down…"));
             log::info!("quit requested, shutting down agent");
+            if overlay.is_running() {
+                if let Err(e) = overlay.toggle() {
+                    log::warn!("failed to close the overlay on quit: {e:#}");
+                }
+            }
             match supervisor::shutdown_agent(&mut sys, agent_port()) {
                 Ok(()) => log::info!("agent shut down cleanly; exiting"),
                 Err(e) => log::error!("exiting, but agent shutdown failed: {e:#}"),
@@ -221,6 +244,18 @@ fn run() -> anyhow::Result<()> {
         } else if menu_event.id() == open_ui_item.id() {
             if let Err(e) = open_ui::open_ui(&mut sys) {
                 log::error!("failed to open UI: {e:#}");
+            }
+        } else if menu_event.id() == overlay_item.id() {
+            match overlay.toggle() {
+                Ok(running) => {
+                    log::info!("overlay {}", if running { "started" } else { "stopped" });
+                    overlay_item.set_text(if running {
+                        "Hide Overlay"
+                    } else {
+                        "Show Overlay"
+                    });
+                }
+                Err(e) => log::error!("failed to toggle the overlay: {e:#}"),
             }
         } else if menu_event.id() == autostart_item.id() {
             // Flips what's registered, not what the checkmark now shows. The

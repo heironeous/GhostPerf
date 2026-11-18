@@ -12,8 +12,9 @@ mod platform;
 mod sampler;
 mod sampling_loop;
 mod stall;
+mod telemetry;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,6 +99,9 @@ fn run() -> anyhow::Result<()> {
     let recording_flag = Arc::new(AtomicBool::new(false));
     // Shared with the sampler and stall threads so `reload` reaches them.
     let live = live::LiveSettings::new(&config);
+    // Shared between the sampler thread (publishes) and the `live` control
+    // command (reads) — see telemetry.rs. Phase 6's overlay.
+    let telemetry = Arc::new(telemetry::Telemetry::new());
 
     let core_handle = {
         let config = config.clone();
@@ -110,10 +114,17 @@ fn run() -> anyhow::Result<()> {
         let recording_flag = recording_flag.clone();
         let core_tx = core_tx.clone();
         let live = live.clone();
+        let telemetry = telemetry.clone();
         std::thread::spawn(move || {
             let mut sampler = sampler::Sampler::new(live.top_n_processes());
             let interval = || live.sample_interval();
-            sampling_loop::run(interval, &recording_flag, |step| match step {
+            // Active for either reason a sample is needed: a session is
+            // recording, or the overlay polled `live` recently enough that
+            // its lease hasn't expired (see telemetry.rs). Neither reason
+            // knows about the other; the sampler thread doesn't need to.
+            let active =
+                || recording_flag.load(Ordering::SeqCst) || telemetry.wants_samples(now_millis());
+            sampling_loop::run(interval, active, |step| match step {
                 sampling_loop::Step::Prime => {
                     sampler.prime();
                     true
@@ -121,6 +132,11 @@ fn run() -> anyhow::Result<()> {
                 sampling_loop::Step::Sample => {
                     sampler.set_top_n(live.top_n_processes());
                     let sample = sampler.sample(now_millis());
+                    telemetry.publish(&sample);
+                    // Only persisted if a session is actually recording
+                    // (core::run's CoreMsg::Sample handler checks that) —
+                    // publishing above happens either way, so the overlay
+                    // gets live numbers with no session active at all.
                     // Err: the core thread has shut down, so stop sampling.
                     core_tx.send(core::CoreMsg::Sample(sample)).is_ok()
                 }
@@ -130,7 +146,8 @@ fn run() -> anyhow::Result<()> {
 
     {
         let core_tx = core_tx.clone();
-        std::thread::spawn(move || ipc::serve(listener, core_tx));
+        let telemetry = telemetry.clone();
+        std::thread::spawn(move || ipc::serve(listener, core_tx, telemetry));
     }
 
     {

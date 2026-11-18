@@ -1,6 +1,6 @@
 ; GhostPerf installer (NSIS). Part of Phase 5 — see TODO.md.
 ;
-; Build with (after a release build has produced the three exes):
+; Build with (after a release build has produced the four exes):
 ;   makensis /INPUTCHARSET UTF8 /DPRODUCT_VERSION=<version> installer\ghostperf.nsi
 ; `build.ps1 -Package` does both steps. See AGENTS.md for how this is
 ; compile-checked (and, with a cross-compiled release build, fully built
@@ -66,11 +66,13 @@ Section "Install"
   nsExec::Exec 'taskkill /F /IM ghostperf-tray.exe'
   nsExec::Exec 'taskkill /F /IM ghostperf-agent.exe'
   nsExec::Exec 'taskkill /F /IM ghostperf-ui.exe'
+  nsExec::Exec 'taskkill /F /IM ghostperf-overlay.exe'
 
   SetOutPath "$INSTDIR"
   File "${RELEASE_DIR}\ghostperf-agent.exe"
   File "${RELEASE_DIR}\ghostperf-tray.exe"
   File "${RELEASE_DIR}\ghostperf-ui.exe"
+  File "${RELEASE_DIR}\ghostperf-overlay.exe"
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\GhostPerf.lnk" "$INSTDIR\ghostperf-tray.exe"
@@ -99,10 +101,12 @@ Section "Uninstall"
   nsExec::Exec 'taskkill /F /IM ghostperf-tray.exe'
   nsExec::Exec 'taskkill /F /IM ghostperf-agent.exe'
   nsExec::Exec 'taskkill /F /IM ghostperf-ui.exe'
+  nsExec::Exec 'taskkill /F /IM ghostperf-overlay.exe'
 
   Delete "$INSTDIR\ghostperf-agent.exe"
   Delete "$INSTDIR\ghostperf-tray.exe"
   Delete "$INSTDIR\ghostperf-ui.exe"
+  Delete "$INSTDIR\ghostperf-overlay.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

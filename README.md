@@ -1,23 +1,24 @@
 # GhostPerf
 
-A lightweight Windows performance monitor built to catch *intermittent* problems — stalls, spikes, leaks — that only show up occasionally and are gone by the time you go looking for them. A background agent records CPU/mem/disk/net/GPU, per-process stats, stall and threshold events, and correlated Event Log entries into a local SQLite file; a tray icon controls it; a session viewer lets you scrub back through a recording afterwards.
+A lightweight Windows performance monitor built to catch *intermittent* problems — stalls, spikes, leaks — that only show up occasionally and are gone by the time you go looking for them. A background agent records CPU/mem/disk/net/GPU, per-process stats, stall and threshold events, and correlated Event Log entries into a local SQLite file; a tray icon controls it; a session viewer lets you scrub back through a recording afterwards; an optional in-game overlay shows live CPU/RAM/GPU while you play.
 
 The shipping target is Windows. It's developed partly in a Linux container (no Windows machine on hand during initial development), so Windows-only code has both a real implementation and a Linux stand-in used purely to keep the build and test suite running during development — see `AGENTS.md` for how that split works and how to verify Windows-only code without a Windows machine.
 
-**Status:** Phases 1–5 (agent core, intermittent-issue detection, tray, session-viewer UI, packaging & polish) are implemented and at least smoke-tested. Full roadmap, what's verified vs. not, and per-phase implementation notes live in [`TODO.md`](TODO.md) — read it before picking up work here.
+**Status:** Phases 1–6 (agent core, intermittent-issue detection, tray, session-viewer UI, packaging & polish, gaming overlay) are implemented and at least smoke-tested. Full roadmap, what's verified vs. not, and per-phase implementation notes live in [`TODO.md`](TODO.md) — read it before picking up work here.
 
 ## Layout
 
-Three binaries, one shared storage format, talking over a local loopback TCP control channel:
+Four binaries, one shared storage format, talking over a local loopback TCP control channel:
 
 | Crate | Binary | What it is |
 |---|---|---|
 | `crates/agent` | `ghostperf-agent` | Background collector: samples metrics, detects stalls/spikes, writes to SQLite. Runs the control server. |
-| `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI". |
+| `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI", "Show/Hide Overlay". |
 | `crates/ui` | `ghostperf-ui` | Session viewer: list recorded sessions, chart CPU/mem/disk/net with event markers, drill into per-process stats, rename/delete/export, and a settings screen — see "Using the UI" below. |
+| `crates/overlay` | `ghostperf-overlay` | Click-through, always-on-top in-game readout of live CPU/RAM/GPU — see "Using the overlay" below. |
 | `crates/storage` | (lib) | SQLite schema + queries, shared by `agent` and `ui`. |
 | `crates/logging` | (lib) | File logging for the (windowless) binaries: the `log` facade backed by `%APPDATA%\GhostPerf\logs\<binary>.log`, plus panic logging. |
-| `crates/agent_config` | (lib) | `AgentConfig` and the `agent.toml` load/default logic, plus the `agent.port` file the agent advertises its control port in — shared by `agent`, `tray`, and `ui` so all agree on these without duplicating the format. |
+| `crates/agent_config` | (lib) | `AgentConfig`/`OverlayConfig` and their `agent.toml`/`overlay.toml` load/default logic, plus the `agent.port` file the agent advertises its control port in — shared by all four binaries so they agree on these without duplicating the format. |
 
 See [`TODO.md`](TODO.md) for the full architecture write-up (data model, IPC protocol, why each language/library choice was made) and [`assets/README.md`](assets/README.md) for the icon/branding assets and how to regenerate them.
 
@@ -51,7 +52,7 @@ On Linux, building `crates/tray` (and, via the same underlying X11/Wayland/GTK p
 ```
 
 Produces, in `dist\`:
-- `GhostPerf-portable-<version>.zip` — the three exes plus an empty `data` folder. Unzip anywhere and run `ghostperf-tray.exe`; that folder's presence (not a flag) is what makes config/database/logs live next to the exe instead of `%APPDATA%\GhostPerf` — no installer, no registry entries, no autostart (the tray doesn't offer "Start with Windows" in a portable copy). Delete the `data` folder to switch that copy back to installed-style behavior. The folder can be moved or copied elsewhere (another drive, a USB stick) and keeps working with its recordings.
+- `GhostPerf-portable-<version>.zip` — the four exes plus an empty `data` folder. Unzip anywhere and run `ghostperf-tray.exe`; that folder's presence (not a flag) is what makes config/database/logs live next to the exe instead of `%APPDATA%\GhostPerf` — no installer, no registry entries, no autostart (the tray doesn't offer "Start with Windows" in a portable copy). Delete the `data` folder to switch that copy back to installed-style behavior. The folder can be moved or copied elsewhere (another drive, a USB stick) and keeps working with its recordings.
 - `GhostPerf-Setup-<version>.exe` — an NSIS installer (`installer/ghostperf.nsi`), only if [NSIS](https://nsis.sourceforge.io/) is installed (`makensis` on `PATH`, or in NSIS's default install folder, where `winget install NSIS.NSIS` puts it without adding it to `PATH`); skipped with a warning otherwise. Installs per-user under `%LocalAppData%\Programs\GhostPerf` (no admin prompt), adds Start Menu shortcuts, registers autostart (the same `HKCU\...\Run` entry the tray's own "Start with Windows" checkbox manages, so either one can toggle it off), and ships an uninstaller that removes all of that but leaves `%APPDATA%\GhostPerf` (your recordings) alone.
 
 ## Running
@@ -64,7 +65,7 @@ Neither binary opens a window or console on Windows (the tray is just the tray i
 
 Config lives at `%APPDATA%\GhostPerf\agent.toml` (TOML, auto-created with defaults on first run — see `AgentConfig` in `crates/agent_config/src/lib.rs` for every field and what it does), unless a `data` folder exists next to the running exe, in which case everything below lives there instead (portable mode — see Packaging). The SQLite database defaults to `ghostperf.db` in that same folder (`db_path = "ghostperf.db"`; a relative `db_path` is relative to that folder, an absolute one is used as is). On non-Windows dev builds, both (and the `logs` directory) default under the OS temp dir instead, since `%APPDATA%` doesn't exist. Completed sessions older than `retention_days` (and, if `retention_max_db_mb` is set, the oldest ones beyond that size too) are auto-pruned after every recording and when the agent starts; a session still recording is never pruned.
 
-The agent also exposes a plain-text control protocol on a loopback TCP port: one newline-terminated command per connection (`start [label]`, `stop`, `status`, `reload` (re-read `agent.toml` and apply it, even mid-recording), `shutdown`), one line of reply. The port isn't configurable: the OS assigns a free one each time the agent starts, and the agent writes it to `agent.port` next to `agent.toml` (deleted again on clean shutdown). This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
+The agent also exposes a plain-text control protocol on a loopback TCP port: one newline-terminated command per connection (`start [label]`, `stop`, `status`, `reload` (re-read `agent.toml` and apply it, even mid-recording), `live` (CPU/RAM/GPU for the overlay; also what keeps the sampler running with no session active), `shutdown`), one line of reply. The port isn't configurable: the OS assigns a free one each time the agent starts, and the agent writes it to `agent.port` next to `agent.toml` (deleted again on clean shutdown). This is what the tray uses, and you can drive it directly for debugging, e.g. from a shell:
 
 ```sh
 PORT=$(cat "$APPDATA/GhostPerf/agent.port")   # on Linux dev builds: $TMPDIR/GhostPerf, usually /tmp/GhostPerf
@@ -80,6 +81,14 @@ Launch `ghostperf-ui` directly, or click "Open UI" in the tray menu, which bring
 - **Sessions** lists every recorded session with its date, duration, label, and quick stats (avg/peak CPU, peak memory, event count). Rename in place or delete (two-step confirm) from here, or click **Open** for the detail view.
 - **Session detail** charts CPU, memory, disk I/O, disk queue length and network over the session, each titled on its left (hover a title for what it shows), with stall/spike/Event-Log markers overlaid. The disk queue chart only appears for sessions that recorded it. Left-drag pans a chart, right-drag box-zooms it (all of them stay in sync); drag on the thin "Select" strip below them to select a time range, which filters the per-process table underneath. Per-process CPU is normalized to whole-machine scale there (the raw per-core value `sysinfo` reports can exceed 100% per process — see TODO.md's Phase 1 note on this). Export the session to CSV or JSON from the bottom of this view.
 - **Settings** edits `agent.toml` (sample interval, retention days, an optional max database size, spike thresholds, Event Log correlation) and shows the DB location. Saving applies the changes to a running agent straight away (it sends the agent `reload`), including to a recording in progress; otherwise they apply when the agent starts.
+
+## Using the overlay
+
+Click "Show Overlay" in the tray menu (it relabels to "Hide Overlay" while it's running — this is a real start/stop toggle, not launch-or-focus like "Open UI"). It shows live CPU/RAM/GPU numbers in a small, click-through, always-on-top window with no border or taskbar entry, so it never steals input or focus from whatever's running underneath it — including a game. It doesn't need a recording session running: it polls the agent's `live` command directly (see `TODO.md` Phase 6), which makes the sampler tick on its own while anything is actually asking for live numbers, and goes back to idle a few seconds after you stop.
+
+Once it's running, the configured global hotkey (`Ctrl+Alt+O` by default) shows/hides it instantly without relaunching — handy for toggling it off for a screenshot or a menu, then back on. Position (which corner, which monitor, margin), opacity, and refresh rate live in `overlay.toml` next to `agent.toml` (`OverlayConfig` in `crates/agent_config/src/overlay_config.rs`; no settings-screen UI for it yet, hand-edit the file and restart the overlay to pick up changes).
+
+Targeting a monitor other than the first one, and drawing over genuine exclusive-fullscreen games (rather than the borderless/windowed-fullscreen most games default to today) are both best-effort — see the caveats in `TODO.md` Phase 6. There's no live FPS counter yet; that needs its own follow-up (also detailed there).
 
 ## Testing
 

@@ -4,10 +4,12 @@
 //! they're formatted without duplicating that logic.
 
 mod control_port;
+mod overlay_config;
 
 pub use control_port::{
     port_file_path, read_port_file, remove_port_file, send_command, write_port_file,
 };
+pub use overlay_config::{OverlayConfig, OverlayCorner};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

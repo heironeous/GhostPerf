@@ -1,8 +1,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::Arc;
 
 use crate::core::CoreMsg;
+use crate::now_millis;
+use crate::telemetry::Telemetry;
 
 /// Binds the loopback-only control socket on an OS-assigned free port (see
 /// `agent_config::control_port` for why the port isn't fixed). Kept
@@ -14,16 +17,18 @@ pub fn bind() -> std::io::Result<TcpListener> {
 }
 
 /// Loopback-only control server. Accepts one newline-terminated command per
-/// connection (`start [label]`, `stop`, `status`, `reload`, `shutdown`) and replies
-/// with a single line before closing. Binding to 127.0.0.1 keeps it off the
-/// network entirely — this is a same-machine control channel, not a remote API.
-pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>) {
+/// connection (`start [label]`, `stop`, `status`, `reload`, `live`,
+/// `shutdown`) and replies with a single line before closing. Binding to
+/// 127.0.0.1 keeps it off the network entirely — this is a same-machine
+/// control channel, not a remote API.
+pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>, telemetry: Arc<Telemetry>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let core_tx = core_tx.clone();
+                let telemetry = telemetry.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, core_tx) {
+                    if let Err(e) = handle_connection(stream, core_tx, telemetry) {
                         log::warn!("connection error: {e}");
                     }
                 });
@@ -33,18 +38,22 @@ pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>) {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, core_tx: Sender<CoreMsg>) -> anyhow::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    core_tx: Sender<CoreMsg>,
+    telemetry: Arc<Telemetry>,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let line = line.trim();
 
-    let response = dispatch(line, &core_tx);
+    let response = dispatch(line, &core_tx, &telemetry);
     writeln!(stream, "{response}")?;
     Ok(())
 }
 
-fn dispatch(line: &str, core_tx: &Sender<CoreMsg>) -> String {
+fn dispatch(line: &str, core_tx: &Sender<CoreMsg>, telemetry: &Telemetry) -> String {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
     let arg = parts.next().map(str::to_string);
@@ -122,10 +131,82 @@ fn dispatch(line: &str, core_tx: &Sender<CoreMsg>) -> String {
                 Err(_) => "ERR no reply from agent core".to_string(),
             }
         }
+        // The overlay's live CPU/RAM/GPU readout (Phase 6). Doesn't touch
+        // `core_tx`/the session store at all — see telemetry.rs for why.
+        // Polling this is also what keeps the sampler thread ticking while
+        // nothing is recording, so a response with no data yet (the
+        // sampler hasn't ticked since this lease started) is expected on
+        // the very first poll or two, not an error.
+        "live" => match telemetry.poll(now_millis()) {
+            Some(s) => format!(
+                "OK cpu_pct={:.1} mem_used_pct={} gpu_pct={} age_ms={}",
+                s.cpu_pct,
+                s.mem_used_pct
+                    .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+                s.gpu_pct
+                    .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+                (now_millis() - s.ts).max(0)
+            ),
+            None => "OK no_data_yet".to_string(),
+        },
         "shutdown" => {
             let _ = core_tx.send(CoreMsg::Shutdown);
             "OK shutting_down".to_string()
         }
         other => format!("ERR unknown command '{other}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::MetricSample;
+
+    fn sample(ts: i64, cpu_pct: f32) -> MetricSample {
+        MetricSample {
+            ts,
+            cpu_pct,
+            cpu_per_core_pct: vec![cpu_pct],
+            mem_used_mb: 1.0,
+            mem_available_mb: 1.0,
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
+            context_switches_per_sec: 0.0,
+            page_faults_per_sec: 0.0,
+            gpu_pct: Some(5.0),
+            disk_queue_len: None,
+            top_processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn live_with_no_data_published_yet() {
+        let (core_tx, _core_rx) = channel();
+        let telemetry = Telemetry::new();
+        assert_eq!(dispatch("live", &core_tx, &telemetry), "OK no_data_yet");
+    }
+
+    #[test]
+    fn live_reports_the_latest_published_sample() {
+        let (core_tx, _core_rx) = channel();
+        let telemetry = Telemetry::new();
+        telemetry.publish(&sample(now_millis(), 42.0));
+        let reply = dispatch("live", &core_tx, &telemetry);
+        assert!(
+            reply.starts_with("OK cpu_pct=42.0 mem_used_pct=") && reply.contains("gpu_pct=5.0"),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_is_an_error() {
+        let (core_tx, _core_rx) = channel();
+        let telemetry = Telemetry::new();
+        assert_eq!(
+            dispatch("nonsense", &core_tx, &telemetry),
+            "ERR unknown command 'nonsense'"
+        );
     }
 }

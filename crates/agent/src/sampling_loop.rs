@@ -15,17 +15,26 @@
 //!   sample used to average over the whole gap since the *previous* session.
 //!   Now the sampler is primed the moment recording starts, so the first
 //!   sample covers exactly its own interval.
+//!
+//! "Active" originally meant only "a session is recording." Phase 6 added a
+//! second, independent reason to be active: the overlay polling live
+//! numbers with nothing recording (see `telemetry::Telemetry::wants_samples`).
+//! Either one dropping to false while the other is still true must not
+//! idle the loop or re-prime it — only the *combined* condition going
+//! false, then true again, is a real idle gap. That's why this takes one
+//! `active` closure rather than a recording flag: the caller ORs whatever
+//! conditions apply, and this loop doesn't need to know what they mean.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// While idle, how often to check whether recording has started. Short so a
-/// session's first sample isn't delayed by up to a whole interval. It's
-/// cheap because it's only an atomic load: no sampling runs while idle.
+/// While idle, how often to check whether sampling should start. Short so
+/// the first sample after becoming active isn't delayed by up to a whole
+/// interval. It's cheap because it's just the `active` closure, typically
+/// one or two atomic loads: no sampling runs while idle.
 const IDLE_POLL: Duration = Duration::from_millis(50);
 
 pub enum Step {
-    /// Recording just started: reset every rate baseline to now, and discard
+    /// Just became active: reset every rate baseline to now, and discard
     /// the result.
     Prime,
     /// Take a sample. The callback returns `false` to stop the loop for good
@@ -33,22 +42,23 @@ pub enum Step {
     Sample,
 }
 
-/// Drives `step` until it returns `false`. Idles cheaply while `recording`
+/// Drives `step` until it returns `false`. Idles cheaply while `active()`
 /// is false. On each start, primes once and then samples every
 /// `interval()`, measured from the prime.
 ///
-/// `interval` is read again for every tick, so a `reload` that changes it
-/// takes effect from the next tick, mid-session included. The tick already
-/// being waited for keeps its old deadline.
+/// `interval` and `active` are both read again on every tick, so a change
+/// — a `reload`'d interval, or recording/overlay-polling starting or
+/// stopping — takes effect from the next tick without restarting the loop.
+/// The tick already being waited for keeps its old deadline.
 pub fn run(
     interval: impl Fn() -> Duration,
-    recording: &AtomicBool,
+    active: impl Fn() -> bool,
     mut step: impl FnMut(Step) -> bool,
 ) {
     // A zero interval (a hand-edited config) would otherwise spin.
     let interval = || interval().max(Duration::from_millis(1));
     loop {
-        while !recording.load(Ordering::SeqCst) {
+        while !active() {
             std::thread::sleep(IDLE_POLL);
         }
         if !step(Step::Prime) {
@@ -60,8 +70,8 @@ pub fn run(
             if deadline > now {
                 std::thread::sleep(deadline - now);
             }
-            if !recording.load(Ordering::SeqCst) {
-                break; // session stopped; back to idle, primed again on the next start
+            if !active() {
+                break; // nothing needs samples anymore; idle, primed again on the next start
             }
             if !step(Step::Sample) {
                 return;
@@ -91,6 +101,7 @@ pub fn next_deadline(prev: Instant, interval: Duration, now: Instant) -> Instant
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     const MS: Duration = Duration::from_millis(1);
@@ -127,7 +138,7 @@ mod tests {
         let mut samples = 0;
         run(
             || interval,
-            &recording,
+            || recording.load(Ordering::SeqCst),
             |step| {
                 if let Step::Sample = step {
                     samples += 1;
@@ -154,7 +165,7 @@ mod tests {
         let mut steps: Vec<(&str, Duration)> = Vec::new();
         run(
             || 50 * MS,
-            &recording,
+            || recording.load(Ordering::SeqCst),
             |step| {
                 steps.push((
                     match step {
@@ -191,13 +202,12 @@ mod tests {
     /// without restarting the loop or the session.
     #[test]
     fn a_changed_interval_applies_from_the_next_tick() {
-        use std::sync::atomic::AtomicU64;
         let recording = AtomicBool::new(true);
         let interval_ms = AtomicU64::new(20);
         let mut sampled_at: Vec<Instant> = Vec::new();
         run(
             || Duration::from_millis(interval_ms.load(Ordering::Relaxed)),
-            &recording,
+            || recording.load(Ordering::SeqCst),
             |step| {
                 if let Step::Sample = step {
                     sampled_at.push(Instant::now());
@@ -212,5 +222,44 @@ mod tests {
         // Before the change: ~20 ms apart. After it: ~150 ms.
         assert!(gaps[0] < 100 * MS && gaps[1] < 100 * MS, "{gaps:?}");
         assert!(gaps[2] >= 140 * MS && gaps[3] >= 140 * MS, "{gaps:?}");
+    }
+
+    /// `main.rs` ORs the recording flag and the overlay's telemetry lease
+    /// into one `active` closure (Phase 6). Handing off between the two
+    /// reasons — one drops while the other is still true — must not idle
+    /// the loop or re-prime: only both being false at once is a real gap.
+    #[test]
+    fn handing_off_between_two_active_reasons_does_not_idle_or_reprime() {
+        let recording = AtomicBool::new(true);
+        let overlay = AtomicBool::new(false);
+        let mut steps: Vec<&str> = Vec::new();
+        run(
+            || 5 * MS,
+            || recording.load(Ordering::SeqCst) || overlay.load(Ordering::SeqCst),
+            |step| {
+                steps.push(match step {
+                    Step::Prime => "prime",
+                    Step::Sample => "sample",
+                });
+                match steps.len() {
+                    // Recording is on alone, then the overlay picks up
+                    // "active" just as recording lets go — never both false
+                    // at once.
+                    2 => {
+                        overlay.store(true, Ordering::SeqCst);
+                        recording.store(false, Ordering::SeqCst);
+                    }
+                    6 => return false,
+                    _ => {}
+                }
+                true
+            },
+        );
+        // Exactly one prime, at the very start; everything after the
+        // handoff is still plain samples, not a second prime.
+        assert_eq!(
+            steps,
+            ["prime", "sample", "sample", "sample", "sample", "sample"]
+        );
     }
 }

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the GhostPerf Cargo workspace (agent, tray, ui).
+    Builds the GhostPerf Cargo workspace (agent, tray, ui, overlay).
 
 .PARAMETER Debug
     Build in debug mode instead of release.
@@ -10,7 +10,7 @@
 
 .PARAMETER Package
     After a release build, also produce dist\GhostPerf-portable-<version>.zip
-    (the three exes plus an empty `data` folder — see
+    (the four exes plus an empty `data` folder — see
     crates/agent_config/src/lib.rs's portable-mode detection) and, if
     NSIS is installed (`makensis` on PATH or in its default install folder),
     dist\GhostPerf-Setup-<version>.exe (installer\ghostperf.nsi).
@@ -54,7 +54,7 @@ try {
     $outDir = Join-Path $repoRoot "target\$profileName"
     Write-Host ""
     Write-Host "Build succeeded. Binaries in $outDir" -ForegroundColor Green
-    $exeNames = @("ghostperf-agent.exe", "ghostperf-tray.exe", "ghostperf-ui.exe")
+    $exeNames = @("ghostperf-agent.exe", "ghostperf-tray.exe", "ghostperf-ui.exe", "ghostperf-overlay.exe")
     foreach ($name in $exeNames) {
         $path = Join-Path $outDir $name
         if (Test-Path $path) {
@@ -76,7 +76,7 @@ try {
         Write-Host ""
         Write-Host "Packaging v$version..." -ForegroundColor Cyan
 
-        # Portable zip: the three exes plus an empty `data` folder, which is
+        # Portable zip: the four exes plus an empty `data` folder, which is
         # the marker crates/agent_config/src/lib.rs's data_dir() checks for
         # — its presence next to the exe is what makes this build portable
         # with no separate flag or rebuild (see TODO.md Phase 5).
