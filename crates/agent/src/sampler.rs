@@ -29,6 +29,12 @@ impl Sampler {
         }
     }
 
+    /// How many processes the next sample keeps (`top_n_processes`, which
+    /// a `reload` can change mid-session).
+    pub fn set_top_n(&mut self, top_n: usize) {
+        self.top_n = top_n;
+    }
+
     /// Resets every rate baseline to now and discards the result: sysinfo's
     /// CPU, per-process CPU and disk deltas, network byte deltas, PDH rate
     /// counters, and `last_tick`. Called when recording starts (see
@@ -114,6 +120,7 @@ impl Sampler {
             context_switches_per_sec: sys_counters.context_switches_per_sec,
             page_faults_per_sec: sys_counters.page_faults_per_sec,
             gpu_pct: sys_counters.gpu_pct,
+            disk_queue_len: sys_counters.disk_queue_len,
             top_processes: process_samples,
         }
     }

@@ -4,8 +4,17 @@ use crate::app::Action;
 use crate::data::{Db, SessionRow};
 use crate::format::{format_datetime, format_duration};
 
+/// How often the list checks whether the agent has written to the
+/// database. egui only repaints on input, so without a scheduled repaint the
+/// check would only run when the mouse moves over the window.
+const CHANGE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct SessionsView {
     rows: Vec<SessionRow>,
+    /// `Db::data_version` as of the last `refresh`. The list used to load
+    /// only when the view was opened, so a session recorded while it was on
+    /// screen didn't appear until you navigated away and back.
+    seen_version: Option<i64>,
     load_error: Option<String>,
     /// `(session_id, in-progress label text)` — only one row editable at a time.
     renaming: Option<(i64, String)>,
@@ -23,6 +32,7 @@ impl SessionsView {
     pub fn empty() -> Self {
         Self {
             rows: Vec::new(),
+            seen_version: None,
             load_error: None,
             renaming: None,
             delete_confirm: None,
@@ -30,6 +40,9 @@ impl SessionsView {
     }
 
     fn refresh(&mut self, db: &Db) {
+        // Read before listing: a commit landing between the two then shows
+        // up as a change on the next check, rather than being missed.
+        self.seen_version = db.data_version().ok();
         match db.list_session_rows() {
             Ok(rows) => {
                 self.rows = rows;
@@ -40,6 +53,15 @@ impl SessionsView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, db: &Db) -> Option<Action> {
+        // The agent writes a session row when recording starts, its samples
+        // at every flush (10 s by default), and its end on stop; each of
+        // those changes the version. Checking it is a single PRAGMA, so the
+        // list (one summary query per session) is only reloaded on a change.
+        ui.ctx().request_repaint_after(CHANGE_POLL);
+        if db.data_version().ok() != self.seen_version {
+            self.refresh(db);
+        }
+
         if let Some(err) = &self.load_error {
             ui.colored_label(egui::Color32::RED, err);
         }

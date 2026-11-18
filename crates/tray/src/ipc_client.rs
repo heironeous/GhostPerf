@@ -1,29 +1,7 @@
-//! Client side of the agent's loopback TCP control channel (see
-//! `agent::ipc` for the server/protocol): one newline-terminated command per
-//! connection, one line of reply, then the connection closes.
+//! The tray's use of the agent's control channel. The client itself is
+//! `agent_config::send_command`, shared with the UI.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::time::Duration;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
-
-pub fn send_command(port: u16, command: &str) -> anyhow::Result<String> {
-    let addr = ("127.0.0.1", port);
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve 127.0.0.1:{port}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-
-    writeln!(stream, "{command}")?;
-
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    Ok(reply.trim().to_string())
-}
+pub use agent_config::send_command;
 
 /// Whether the agent is currently recording, parsed from a `status` reply
 /// like `OK recording=true session_id=3 started_at=... buffered=2`.
@@ -40,6 +18,7 @@ pub fn is_recording(port: u16) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
     /// A minimal stand-in for the agent's control server: replies with a
@@ -62,12 +41,6 @@ mod tests {
             }
         });
         port
-    }
-
-    #[test]
-    fn send_command_returns_the_trimmed_reply_line() {
-        let port = serve_one_reply("OK session_id=1");
-        assert_eq!(send_command(port, "start").unwrap(), "OK session_id=1");
     }
 
     #[test]

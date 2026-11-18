@@ -71,6 +71,14 @@ pub struct MetricSample {
     /// `None` when no GPU counter is available on this machine.
     #[serde(default)]
     pub gpu_pct: Option<f32>,
+    /// Average number of disk requests outstanding (queued or in service)
+    /// across all physical disks over the sample interval. `None` when the
+    /// counter isn't available, and for samples recorded before it was
+    /// added. Sustained values well above the number of disks mean I/O is
+    /// backing up, which byte rates alone don't show: a stalled disk moves
+    /// few bytes.
+    #[serde(default)]
+    pub disk_queue_len: Option<f32>,
     pub top_processes: Vec<ProcessSample>,
 }
 
@@ -185,6 +193,7 @@ impl Store {
         )?;
         self.ensure_column("metrics", "page_faults_per_sec", "REAL NOT NULL DEFAULT 0")?;
         self.ensure_column("metrics", "gpu_pct", "REAL")?;
+        self.ensure_column("metrics", "disk_queue_len", "REAL")?;
 
         Ok(())
     }
@@ -203,6 +212,18 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// SQLite's `PRAGMA data_version`: a number that changes whenever
+    /// *another* connection (the agent, seen from the UI) commits to the
+    /// database, and stays the same otherwise. Commits made through this
+    /// connection don't change it. Only meaningful compared with an earlier
+    /// value from the same `Store`; it's a cheap way to ask "did anything
+    /// change?" without re-running queries.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
 
     pub fn start_session(
@@ -255,8 +276,9 @@ impl Store {
                 "INSERT INTO metrics (
                     session_id, ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb,
                     disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps,
-                    context_switches_per_sec, page_faults_per_sec, gpu_pct, top_processes_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    context_switches_per_sec, page_faults_per_sec, gpu_pct, disk_queue_len,
+                    top_processes_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             for s in samples {
                 let cpu_per_core_json = serde_json::to_string(&s.cpu_per_core_pct)?;
@@ -275,6 +297,7 @@ impl Store {
                     s.context_switches_per_sec,
                     s.page_faults_per_sec,
                     s.gpu_pct,
+                    s.disk_queue_len,
                     top_json,
                 ])?;
             }
@@ -355,12 +378,12 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb, disk_read_bps,
                     disk_write_bps, net_rx_bps, net_tx_bps, context_switches_per_sec,
-                    page_faults_per_sec, gpu_pct, top_processes_json
+                    page_faults_per_sec, gpu_pct, disk_queue_len, top_processes_json
              FROM metrics WHERE session_id = ?1 ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             let cpu_per_core_json: String = row.get(2)?;
-            let top_json: String = row.get(12)?;
+            let top_json: String = row.get(13)?;
             Ok((
                 MetricSample {
                     ts: row.get(0)?,
@@ -375,6 +398,7 @@ impl Store {
                     context_switches_per_sec: row.get(9)?,
                     page_faults_per_sec: row.get(10)?,
                     gpu_pct: row.get(11)?,
+                    disk_queue_len: row.get(12)?,
                     top_processes: Vec::new(),
                 },
                 cpu_per_core_json,
@@ -572,6 +596,7 @@ mod tests {
             context_switches_per_sec: 2500.0,
             page_faults_per_sec: 75.0,
             gpu_pct: Some(33.0),
+            disk_queue_len: Some(1.5),
             top_processes: vec![ProcessSample {
                 pid: 42,
                 name: "example.exe".into(),
@@ -594,6 +619,7 @@ mod tests {
         assert_eq!(metrics[0].top_processes[0].handle_count, Some(200));
         assert_eq!(metrics[0].context_switches_per_sec, 2500.0);
         assert_eq!(metrics[0].gpu_pct, Some(33.0));
+        assert_eq!(metrics[0].disk_queue_len, Some(1.5));
     }
 
     #[test]
@@ -690,6 +716,7 @@ mod tests {
             context_switches_per_sec: 0.0,
             page_faults_per_sec: 0.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: Vec::new(),
         };
         store
@@ -766,6 +793,7 @@ mod tests {
             context_switches_per_sec: 0.0,
             page_faults_per_sec: 0.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: Vec::new(),
         };
         assert_eq!(s.mem_total_mb(), 64_000.0);
@@ -795,6 +823,7 @@ mod tests {
             context_switches_per_sec: 0.0,
             page_faults_per_sec: 0.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: Vec::new(),
         }
     }
@@ -997,6 +1026,38 @@ mod tests {
         assert_eq!(events[1].detail.as_deref(), Some("exceeded 90%"));
     }
 
+    /// What the UI's session list relies on to notice the agent's writes.
+    #[test]
+    fn data_version_changes_only_when_another_connection_commits() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ghostperf-storage-data-version-test-{}.db",
+            std::process::id()
+        ));
+        let reader = Store::open(&db_path).unwrap();
+        let writer = Store::open(&db_path).unwrap();
+
+        let before = reader.data_version().unwrap();
+        assert_eq!(
+            reader.data_version().unwrap(),
+            before,
+            "unchanged without writes"
+        );
+
+        writer.start_session(1, None, None).unwrap();
+        let after_other = reader.data_version().unwrap();
+        assert_ne!(after_other, before, "another connection's commit must show");
+
+        // The reader's own writes don't count: the UI refreshes itself after
+        // its own renames and deletes.
+        reader.start_session(2, None, None).unwrap();
+        assert_eq!(reader.data_version().unwrap(), after_other);
+
+        drop((reader, writer));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+    }
+
     #[test]
     fn migrate_adds_missing_columns_to_existing_metrics_table() {
         let db_path = std::env::temp_dir().join(format!(
@@ -1045,11 +1106,13 @@ mod tests {
             context_switches_per_sec: 9.0,
             page_faults_per_sec: 3.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: Vec::new(),
         };
         store.insert_metrics_batch(id, &[sample]).unwrap();
         let metrics = store.metrics_for_session(id).unwrap();
         assert_eq!(metrics[0].context_switches_per_sec, 9.0);
+        assert_eq!(metrics[0].disk_queue_len, None);
 
         drop(store);
         for suffix in ["", "-wal", "-shm"] {

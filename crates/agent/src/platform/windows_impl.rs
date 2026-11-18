@@ -25,6 +25,17 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Adds a counter that may not exist on every machine; `None` if PDH
+/// refuses it, rather than failing the whole query.
+///
+/// # Safety
+/// `query` must be an open PDH query.
+unsafe fn add_optional_counter(query: PDH_HQUERY, path: &str) -> Option<PDH_HCOUNTER> {
+    let path = wide(path);
+    let mut counter = PDH_HCOUNTER::default();
+    (PdhAddEnglishCounterW(query, PCWSTR(path.as_ptr()), 0, &mut counter) == 0).then_some(counter)
+}
+
 pub struct PlatformCounters {
     query: PDH_HQUERY,
     ctxt_counter: PDH_HCOUNTER,
@@ -33,6 +44,10 @@ pub struct PlatformCounters {
     /// (older Windows, or a VM without a GPU scheduler) — GPU sampling is
     /// explicitly best-effort per the Phase 2 plan.
     gpu_counter: Option<PDH_HCOUNTER>,
+    /// `None` if the PhysicalDisk counter set is missing or disabled
+    /// (`diskperf -n`, or a damaged perf counter registry); best-effort
+    /// like the GPU counter.
+    disk_queue_counter: Option<PDH_HCOUNTER>,
     /// Refreshed once per `sample_system` call via a single toolhelp
     /// snapshot, so per-process `thread_count` lookups are free instead of
     /// costing a syscall per process.
@@ -58,18 +73,18 @@ impl PlatformCounters {
                 &mut pgfault_counter,
             );
 
-            let mut gpu_counter_raw = PDH_HCOUNTER::default();
-            let gpu_path = wide(r"\GPU Engine(*)\Utilization Percentage");
-            let gpu_counter =
-                if PdhAddEnglishCounterW(query, PCWSTR(gpu_path.as_ptr()), 0, &mut gpu_counter_raw)
-                    == 0
-                {
-                    Some(gpu_counter_raw)
-                } else {
-                    None
-                };
+            let gpu_counter = add_optional_counter(query, r"\GPU Engine(*)\Utilization Percentage");
+            // "Avg." rather than "Current Disk Queue Length": the current
+            // one is an instantaneous snapshot taken once a second, which
+            // misses a queue that builds and drains between two samples.
+            // The average covers the whole interval since the last
+            // collection, which is what a 1 s sample should describe.
+            // `_Total` sums the queues of all physical disks.
+            let disk_queue_counter =
+                add_optional_counter(query, r"\PhysicalDisk(_Total)\Avg. Disk Queue Length");
 
-            // Rate counters (`/sec`, GPU utilization) need two collections
+            // Rate and average counters (`/sec`, GPU utilization, average
+            // disk queue length) need two collections
             // before they can format a value. Prime the query now so the
             // first real sample reports a rate instead of 0 / None.
             let _ = PdhCollectQueryData(query);
@@ -79,6 +94,7 @@ impl PlatformCounters {
                 ctxt_counter,
                 pgfault_counter,
                 gpu_counter,
+                disk_queue_counter,
                 thread_cache: HashMap::new(),
             }
         }
@@ -92,6 +108,10 @@ impl PlatformCounters {
         let context_switches_per_sec = self.read_double(self.ctxt_counter).unwrap_or(0.0);
         let page_faults_per_sec = self.read_double(self.pgfault_counter).unwrap_or(0.0);
         let gpu_pct = self.gpu_counter.and_then(|c| self.read_gpu_array(c));
+        let disk_queue_len = self
+            .disk_queue_counter
+            .and_then(|c| self.read_double(c))
+            .map(|v| v as f32);
 
         self.refresh_thread_cache();
 
@@ -99,6 +119,7 @@ impl PlatformCounters {
             context_switches_per_sec,
             page_faults_per_sec,
             gpu_pct,
+            disk_queue_len,
         }
     }
 

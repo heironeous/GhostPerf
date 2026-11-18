@@ -25,4 +25,7 @@ pub struct SystemCounters {
     pub page_faults_per_sec: f64,
     /// `None` when no GPU counter could be read on this machine.
     pub gpu_pct: Option<f32>,
+    /// Average disk queue length over the interval (see
+    /// `storage::MetricSample::disk_queue_len`); `None` when unavailable.
+    pub disk_queue_len: Option<f32>,
 }

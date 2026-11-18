@@ -9,6 +9,7 @@ use super::SystemCounters;
 pub struct PlatformCounters {
     prev_ctxt: Option<u64>,
     prev_pgfault: Option<u64>,
+    prev_disk_weighted_ms: Option<u64>,
 }
 
 impl PlatformCounters {
@@ -16,12 +17,27 @@ impl PlatformCounters {
         Self {
             prev_ctxt: None,
             prev_pgfault: None,
+            prev_disk_weighted_ms: None,
         }
     }
 
     pub fn sample_system(&mut self, elapsed_secs: f64) -> SystemCounters {
         let ctxt = read_proc_stat_ctxt();
         let pgfault = read_proc_vmstat_pgfault();
+        let disk_weighted_ms = fs::read_to_string("/proc/diskstats")
+            .ok()
+            .and_then(|text| diskstats_weighted_ms(&text, is_whole_disk));
+        // Weighted I/O time grows by (requests in flight × elapsed ms), so its
+        // growth per elapsed ms is the average queue length over the
+        // interval: the same quantity as Windows' "Avg. Disk Queue Length",
+        // and what `iostat` reports as `aqu-sz`.
+        let disk_queue_len = match (disk_weighted_ms, self.prev_disk_weighted_ms) {
+            (Some(now), Some(prev)) => {
+                Some((now.saturating_sub(prev) as f64 / (elapsed_secs * 1000.0)) as f32)
+            }
+            _ => None,
+        };
+        self.prev_disk_weighted_ms = disk_weighted_ms;
 
         let context_switches_per_sec = match (ctxt, self.prev_ctxt) {
             (Some(now), Some(prev)) => now.saturating_sub(prev) as f64 / elapsed_secs,
@@ -40,6 +56,7 @@ impl PlatformCounters {
             page_faults_per_sec,
             // No simple cross-vendor GPU utilization counter on Linux.
             gpu_pct: None,
+            disk_queue_len,
         }
     }
 
@@ -65,6 +82,34 @@ fn read_proc_stat_ctxt() -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("ctxt "))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// Whole disks only (`sda`, `nvme0n1`), not their partitions, which would
+/// count the same requests twice. `/sys/block` lists exactly the whole
+/// disks; loop and RAM devices are left out as not real I/O.
+fn is_whole_disk(name: &str) -> bool {
+    !name.starts_with("loop")
+        && !name.starts_with("ram")
+        && std::path::Path::new("/sys/block").join(name).exists()
+}
+
+/// Sum over the devices `include` accepts of the 11th stats field of
+/// `/proc/diskstats` (the line's 14th column): "weighted time spent doing
+/// I/Os", in ms. `None` if no device was counted.
+fn diskstats_weighted_ms(text: &str, include: impl Fn(&str) -> bool) -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (Some(name), Some(weighted)) = (cols.get(2).copied(), cols.get(13)) else {
+            continue;
+        };
+        if let (true, Ok(ms)) = (include(name), weighted.parse::<u64>()) {
+            total += ms;
+            found = true;
+        }
+    }
+    found.then_some(total)
 }
 
 /// Sum of minor + major page faults, matching the intent of Windows'
@@ -118,6 +163,22 @@ mod tests {
 
         let second = counters.sample_system(0.05);
         assert!(second.context_switches_per_sec >= 0.0);
+    }
+
+    #[test]
+    fn diskstats_sums_weighted_io_time_of_the_included_devices() {
+        // Real /proc/diskstats layout (kernel 5.5+, 20 columns); the 14th
+        // column is the weighted I/O time.
+        let text = "\
+   8       0 sda 1000 0 2000 300 400 0 800 500 0 600 900 0 0 0 0 0 0
+   8       1 sda1 900 0 1800 280 390 0 780 490 0 580 870 0 0 0 0 0 0
+ 259       0 nvme0n1 50 0 100 10 20 0 40 30 2 60 75 0 0 0 0 0 0
+   7       0 loop0 5 0 10 1 0 0 0 0 0 1 99 0 0 0 0 0 0
+garbage line
+";
+        let whole = |name: &str| matches!(name, "sda" | "nvme0n1");
+        assert_eq!(diskstats_weighted_ms(text, whole), Some(900 + 75));
+        assert_eq!(diskstats_weighted_ms(text, |_| false), None);
     }
 
     #[test]

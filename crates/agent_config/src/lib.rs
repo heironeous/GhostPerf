@@ -5,7 +5,9 @@
 
 mod control_port;
 
-pub use control_port::{port_file_path, read_port_file, remove_port_file, write_port_file};
+pub use control_port::{
+    port_file_path, read_port_file, remove_port_file, send_command, write_port_file,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -155,8 +157,9 @@ impl AgentConfig {
     }
 
     /// Writes this config back to `path` (e.g. after the UI's settings
-    /// screen edits it). Takes effect the next time the agent starts — it
-    /// doesn't watch the file or hot-reload.
+    /// screen edits it). The agent doesn't watch the file: a running agent
+    /// picks the change up when sent the `reload` control command, which
+    /// the settings screen does right after saving.
     pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -165,6 +168,33 @@ impl AgentConfig {
         std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
     }
+
+    /// `name: old -> new` for each setting that differs between `self` and
+    /// `other`, in name order, for the agent to log what a reload changed.
+    /// Compared through the TOML form, so it covers every field, including
+    /// ones added later, without listing them here.
+    pub fn changed_settings(&self, other: &Self) -> Vec<String> {
+        let (Ok(toml::Value::Table(old)), Ok(toml::Value::Table(new))) =
+            (toml::Value::try_from(self), toml::Value::try_from(other))
+        else {
+            return Vec::new();
+        };
+        // An `Option` field that's `None` is left out of the TOML entirely.
+        let show =
+            |v: Option<&toml::Value>| v.map_or_else(|| "unset".to_string(), |v| v.to_string());
+        let names: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+        names
+            .into_iter()
+            .filter(|name| old.get(*name) != new.get(*name))
+            .map(|name| format!("{name}: {} -> {}", show(old.get(name)), show(new.get(name))))
+            .collect()
+    }
+}
+
+/// Whether this copy runs in portable mode (a `data` folder next to the
+/// exe; see [`data_dir`]).
+pub fn is_portable() -> bool {
+    portable_data_dir().is_some()
 }
 
 #[cfg(test)]
@@ -267,6 +297,25 @@ retention_days = 30
     fn an_absolute_db_path_is_used_as_is() {
         let abs = std::env::temp_dir().join("elsewhere").join("ghostperf.db");
         assert_eq!(resolve_db_path(Path::new("unused"), &abs), abs);
+    }
+
+    #[test]
+    fn changed_settings_lists_only_what_differs() {
+        let old = AgentConfig::default();
+        assert!(old.changed_settings(&old.clone()).is_empty());
+
+        let new = AgentConfig {
+            sample_interval_ms: 500,
+            retention_max_db_mb: Some(200),
+            ..old.clone()
+        };
+        assert_eq!(
+            old.changed_settings(&new),
+            [
+                "retention_max_db_mb: unset -> 200",
+                "sample_interval_ms: 1000 -> 500"
+            ]
+        );
     }
 
     #[test]

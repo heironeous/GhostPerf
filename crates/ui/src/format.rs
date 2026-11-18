@@ -78,6 +78,23 @@ pub fn format_pct(pct: f64) -> String {
     format!("{pct:.0}%")
 }
 
+/// A disk queue length (a plain count, usually well under 10): `0`,
+/// `0.25`, `1.5`, `12`. Two decimals at most, trailing zeros dropped, so
+/// the grid's 0.1/0.2 steps label as `0.1`, `0.2` rather than `0.10`; whole
+/// numbers from 100 up, to stay inside the shared y-axis width.
+pub fn format_queue(len: f64) -> String {
+    if len.abs() >= 100.0 {
+        return format!("{len:.0}");
+    }
+    let s = format!("{len:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,9 +129,26 @@ mod tests {
             format_rate(9_900_000.0),
             format_mb(131_072.0),
             format_pct(100.0),
+            format_queue(-0.125),
+            format_queue(99.99),
+            format_queue(12_345.0),
         ] {
             assert!(label.chars().count() <= 10, "{label:?} is too long");
         }
+    }
+
+    #[test]
+    fn queue_lengths_drop_trailing_zeros() {
+        assert_eq!(format_queue(0.0), "0");
+        assert_eq!(format_queue(0.1), "0.1");
+        assert_eq!(format_queue(0.25), "0.25");
+        assert_eq!(format_queue(1.5), "1.5");
+        assert_eq!(format_queue(2.0), "2");
+        assert_eq!(format_queue(12.0), "12");
+        assert_eq!(format_queue(150.4), "150");
+        // Auto-bounds pad below 0; a value that rounds to zero isn't "-0".
+        assert_eq!(format_queue(-0.001), "0");
+        assert_eq!(format_queue(-0.5), "-0.5");
     }
 
     #[test]

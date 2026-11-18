@@ -20,6 +20,11 @@ impl Db {
         })
     }
 
+    /// See `Store::data_version`.
+    pub fn data_version(&self) -> anyhow::Result<i64> {
+        Ok(self.store.data_version()?)
+    }
+
     pub fn list_session_rows(&self) -> anyhow::Result<Vec<SessionRow>> {
         self.store
             .list_sessions()?

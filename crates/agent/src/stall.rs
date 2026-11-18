@@ -20,14 +20,18 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// anything beyond `threshold` is recorded as a stall event. Only emits
 /// while a session is recording — a stall with nothing to attribute it to
 /// isn't useful to store.
+///
+/// `timing` returns `(check_interval, threshold)` and is read again on every
+/// wakeup, so a `reload` that changes either applies without restarting
+/// this thread.
 pub fn run(
     core_tx: Sender<CoreMsg>,
     recording_flag: Arc<AtomicBool>,
-    check_interval: Duration,
-    threshold: Duration,
+    timing: impl Fn() -> (Duration, Duration),
 ) {
     let mut last_wake = Instant::now();
     loop {
+        let (check_interval, threshold) = timing();
         // Read once before sleeping (to pick the sleep duration) and once
         // after (to see whether recording changed while we were asleep).
         // Only a sleep that was `recording` on both sides is a meaningful
@@ -84,7 +88,9 @@ mod tests {
         // qualifies, so this doesn't depend on actually observing scheduler
         // jitter within the test's time budget.
         let handle = std::thread::spawn(move || {
-            run(tx, flag_clone, Duration::from_millis(5), Duration::ZERO);
+            run(tx, flag_clone, || {
+                (Duration::from_millis(5), Duration::ZERO)
+            });
         });
 
         let event = rx
@@ -108,12 +114,9 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
 
         std::thread::spawn(move || {
-            run(
-                tx,
-                flag,
-                Duration::from_millis(1),
-                Duration::from_millis(50),
-            );
+            run(tx, flag, || {
+                (Duration::from_millis(1), Duration::from_millis(50))
+            });
         });
 
         // Longer than IDLE_POLL_INTERVAL, so this actually exercises an
@@ -136,12 +139,9 @@ mod tests {
         // measurement after flipping the flag would overshoot by close to
         // a full IDLE_POLL_INTERVAL and wrongly fire as a stall.
         std::thread::spawn(move || {
-            run(
-                tx,
-                flag_clone,
-                Duration::from_millis(5),
-                Duration::from_millis(20),
-            );
+            run(tx, flag_clone, || {
+                (Duration::from_millis(5), Duration::from_millis(20))
+            });
         });
 
         // Let it settle into idle polling, then start "recording".

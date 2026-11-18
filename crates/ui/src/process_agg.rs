@@ -139,6 +139,7 @@ mod tests {
             context_switches_per_sec: 0.0,
             page_faults_per_sec: 0.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: procs,
         }
     }

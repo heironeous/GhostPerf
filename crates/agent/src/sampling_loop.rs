@@ -34,11 +34,19 @@ pub enum Step {
 }
 
 /// Drives `step` until it returns `false`. Idles cheaply while `recording`
-/// is false. On each start, primes once and then samples every `interval`,
-/// measured from the prime.
-pub fn run(interval: Duration, recording: &AtomicBool, mut step: impl FnMut(Step) -> bool) {
+/// is false. On each start, primes once and then samples every
+/// `interval()`, measured from the prime.
+///
+/// `interval` is read again for every tick, so a `reload` that changes it
+/// takes effect from the next tick, mid-session included. The tick already
+/// being waited for keeps its old deadline.
+pub fn run(
+    interval: impl Fn() -> Duration,
+    recording: &AtomicBool,
+    mut step: impl FnMut(Step) -> bool,
+) {
     // A zero interval (a hand-edited config) would otherwise spin.
-    let interval = interval.max(Duration::from_millis(1));
+    let interval = || interval().max(Duration::from_millis(1));
     loop {
         while !recording.load(Ordering::SeqCst) {
             std::thread::sleep(IDLE_POLL);
@@ -46,7 +54,7 @@ pub fn run(interval: Duration, recording: &AtomicBool, mut step: impl FnMut(Step
         if !step(Step::Prime) {
             return;
         }
-        let mut deadline = Instant::now() + interval;
+        let mut deadline = Instant::now() + interval();
         loop {
             let now = Instant::now();
             if deadline > now {
@@ -58,7 +66,7 @@ pub fn run(interval: Duration, recording: &AtomicBool, mut step: impl FnMut(Step
             if !step(Step::Sample) {
                 return;
             }
-            deadline = next_deadline(deadline, interval, Instant::now());
+            deadline = next_deadline(deadline, interval(), Instant::now());
         }
     }
 }
@@ -117,13 +125,17 @@ mod tests {
         let interval = 40 * MS;
         let start = Instant::now();
         let mut samples = 0;
-        run(interval, &recording, |step| {
-            if let Step::Sample = step {
-                samples += 1;
-                std::thread::sleep(15 * MS);
-            }
-            start.elapsed() < Duration::from_secs(1)
-        });
+        run(
+            || interval,
+            &recording,
+            |step| {
+                if let Step::Sample = step {
+                    samples += 1;
+                    std::thread::sleep(15 * MS);
+                }
+                start.elapsed() < Duration::from_secs(1)
+            },
+        );
         // 1000 / 40 = 25 ideal. Allow scheduler slack, but stay well clear
         // of the ~18 the old loop produced.
         assert!(samples >= 22, "only {samples} samples in 1 s at 40 ms");
@@ -140,16 +152,20 @@ mod tests {
 
         let begin = Instant::now();
         let mut steps: Vec<(&str, Duration)> = Vec::new();
-        run(50 * MS, &recording, |step| {
-            steps.push((
-                match step {
-                    Step::Prime => "prime",
-                    Step::Sample => "sample",
-                },
-                begin.elapsed(),
-            ));
-            steps.len() < 4
-        });
+        run(
+            || 50 * MS,
+            &recording,
+            |step| {
+                steps.push((
+                    match step {
+                        Step::Prime => "prime",
+                        Step::Sample => "sample",
+                    },
+                    begin.elapsed(),
+                ));
+                steps.len() < 4
+            },
+        );
         starter.join().unwrap();
 
         let kinds: Vec<_> = steps.iter().map(|(k, _)| *k).collect();
@@ -169,5 +185,32 @@ mod tests {
             first_gap >= 45 * MS && first_gap < 100 * MS,
             "{first_gap:?}"
         );
+    }
+
+    /// What `reload` relies on: a new interval applies from the next tick,
+    /// without restarting the loop or the session.
+    #[test]
+    fn a_changed_interval_applies_from_the_next_tick() {
+        use std::sync::atomic::AtomicU64;
+        let recording = AtomicBool::new(true);
+        let interval_ms = AtomicU64::new(20);
+        let mut sampled_at: Vec<Instant> = Vec::new();
+        run(
+            || Duration::from_millis(interval_ms.load(Ordering::Relaxed)),
+            &recording,
+            |step| {
+                if let Step::Sample = step {
+                    sampled_at.push(Instant::now());
+                    if sampled_at.len() == 3 {
+                        interval_ms.store(150, Ordering::Relaxed);
+                    }
+                }
+                sampled_at.len() < 5
+            },
+        );
+        let gaps: Vec<Duration> = sampled_at.windows(2).map(|w| w[1] - w[0]).collect();
+        // Before the change: ~20 ms apart. After it: ~150 ms.
+        assert!(gaps[0] < 100 * MS && gaps[1] < 100 * MS, "{gaps:?}");
+        assert!(gaps[2] >= 140 * MS && gaps[3] >= 140 * MS, "{gaps:?}");
     }
 }

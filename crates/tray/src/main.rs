@@ -52,6 +52,20 @@ fn send_to_agent(port: Option<u16>, command: &str) {
     }
 }
 
+/// Sets the "Start with Windows" checkmark to what's actually registered.
+/// Left alone if the registry can't be read, rather than guessing.
+fn sync_autostart_check(item: &CheckMenuItem) {
+    if let Ok(enabled) = autostart::is_enabled() {
+        if item.is_checked() != enabled {
+            log::info!(
+                "'Start with Windows' is now {}",
+                if enabled { "on" } else { "off" }
+            );
+            item.set_checked(enabled);
+        }
+    }
+}
+
 fn main() {
     let log_file = logging::init(&agent_config::log_dir(), "tray");
     log::info!(
@@ -101,12 +115,14 @@ fn run() -> anyhow::Result<()> {
     let start_item = MenuItem::new("Start recording", true, None);
     let stop_item = MenuItem::new("Stop recording", false, None);
     let open_ui_item = MenuItem::new("Open UI", true, None);
-    let autostart_item = CheckMenuItem::new(
-        "Start with Windows",
-        true,
-        autostart::is_enabled().unwrap_or(false),
-        None,
-    );
+    let autostart_on = autostart::is_enabled().unwrap_or(false);
+    let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart_on, None);
+    // A portable copy is meant to leave nothing behind on the machine, and
+    // a Run entry pointing into a folder on a USB stick breaks as soon as
+    // the stick is gone. So the option is hidden there, unless this copy
+    // was already registered (by an earlier version, which offered it), so
+    // that it can still be switched off.
+    let offer_autostart = !agent_config::is_portable() || autostart_on;
     let quit_item = MenuItem::new("Quit", true, None);
 
     let menu = Menu::new();
@@ -114,8 +130,10 @@ fn run() -> anyhow::Result<()> {
     menu.append(&stop_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&open_ui_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&autostart_item)?;
+    if offer_autostart {
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&autostart_item)?;
+    }
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -153,6 +171,15 @@ fn run() -> anyhow::Result<()> {
                         Ok(false) => {}
                         Err(e) => log::error!("failed to relaunch agent: {e:#}"),
                     }
+                }
+
+                // The Run value can change behind the tray's back: the
+                // installer and uninstaller write it, and so does a second
+                // copy of GhostPerf. Reading it once at startup left the
+                // checkmark wrong until the next start. One registry read a
+                // second is negligible next to the status request above.
+                if offer_autostart {
+                    sync_autostart_check(&autostart_item);
                 }
 
                 if let Some(now_recording) = status {
@@ -196,16 +223,19 @@ fn run() -> anyhow::Result<()> {
                 log::error!("failed to open UI: {e:#}");
             }
         } else if menu_event.id() == autostart_item.id() {
-            let result = if autostart_item.is_checked() {
-                autostart::enable()
-            } else {
-                autostart::disable()
+            // Flips what's registered, not what the checkmark now shows. The
+            // menu toggles the checkmark itself on click, but a poll handled
+            // between that click and this event may already have reset it
+            // from the registry, and acting on it would then undo the click.
+            let result = match autostart::is_enabled() {
+                Ok(true) => autostart::disable(),
+                Ok(false) => autostart::enable(),
+                Err(e) => Err(e),
             };
             if let Err(e) = result {
-                log::error!("failed to update autostart: {e}");
-                // Reflect reality rather than the toggle the user just made.
-                autostart_item.set_checked(!autostart_item.is_checked());
+                log::error!("failed to update autostart: {e:#}");
             }
+            sync_autostart_check(&autostart_item);
         }
     });
 }

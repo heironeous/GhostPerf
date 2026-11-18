@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use storage::{MetricSample, NewEvent, Store};
 
 use crate::eventlog;
+use crate::live::LiveSettings;
 use crate::now_millis;
 use agent_config::AgentConfig;
 
@@ -19,6 +20,13 @@ pub enum CoreMsg {
     },
     Status {
         reply: Sender<StatusSnapshot>,
+    },
+    /// Apply a freshly loaded `agent.toml` while running (the `reload`
+    /// command, sent by the UI after saving its settings). Replies with the
+    /// changes it applied.
+    Reload {
+        config: Box<AgentConfig>,
+        reply: Sender<Vec<String>>,
     },
     Sample(MetricSample),
     /// A stall, threshold spike, or (eventually) a correlated OS event —
@@ -46,13 +54,14 @@ pub struct StatusSnapshot {
 pub fn run(
     store: Store,
     rx: Receiver<CoreMsg>,
-    config: AgentConfig,
+    mut config: AgentConfig,
     recording_flag: Arc<AtomicBool>,
+    live: Arc<LiveSettings>,
 ) {
     let mut buffer: Vec<MetricSample> = Vec::with_capacity(config.flush_batch_size);
     let mut events_buffer: Vec<NewEvent> = Vec::new();
     let mut current_session: Option<(i64, i64)> = None; // (id, started_at)
-    let flush_interval = Duration::from_millis(config.flush_interval_ms);
+    let mut flush_interval = Duration::from_millis(config.flush_interval_ms);
     // The time-based flush is tracked against a deadline rather than relying on
     // `recv_timeout` alone: while recording, samples arrive every
     // `sample_interval_ms`, so a plain `recv_timeout(flush_interval)` would
@@ -110,6 +119,26 @@ pub fn run(
                     samples_buffered: buffer.len(),
                 };
                 let _ = reply.send(snapshot);
+            }
+            Ok(CoreMsg::Reload {
+                config: new_config,
+                reply,
+            }) => {
+                let new_config = keep_db_path(&config, *new_config);
+                let changes = config.changed_settings(&new_config);
+                config = new_config;
+                live.apply(&config);
+                flush_interval = Duration::from_millis(config.flush_interval_ms);
+                if changes.is_empty() {
+                    log::info!("reload: no settings changed");
+                } else {
+                    log::info!("reload applied: {}", changes.join(", "));
+                }
+                // Reply before pruning: a size-cap prune ends in a VACUUM,
+                // which on a large database can outlast the client's 2 s
+                // read timeout, and the settings are already in effect.
+                let _ = reply.send(changes);
+                prune_by_retention(&store, &config);
             }
             Ok(CoreMsg::Sample(sample)) => {
                 if current_session.is_some() {
@@ -169,6 +198,20 @@ pub fn run(
             last_flush = Instant::now();
         }
     }
+}
+
+/// `new` with `db_path` reset to the running one. The store stays open on
+/// the database the agent started with, so a changed `db_path` (only
+/// editable by hand; the UI shows it read-only) applies at the next start.
+fn keep_db_path(running: &AgentConfig, mut new: AgentConfig) -> AgentConfig {
+    if new.db_path != running.db_path {
+        log::warn!(
+            "reload: db_path changed to {}; it takes effect when the agent restarts",
+            new.db_path.display()
+        );
+        new.db_path = running.db_path.clone();
+    }
+    new
 }
 
 /// A sample at or above either threshold is recorded as a spike event
@@ -279,6 +322,96 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
 
+    fn run_core(store: Store, rx: Receiver<CoreMsg>, config: AgentConfig, flag: Arc<AtomicBool>) {
+        let live = LiveSettings::new(&config);
+        run(store, rx, config, flag, live)
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ghostperf-core-{name}-test-{}-{}.db",
+            std::process::id(),
+            now_millis()
+        ))
+    }
+
+    fn remove_db(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// `reload` mid-session: the core applies new thresholds to the very
+    /// next sample, updates the threads' live settings, keeps the running
+    /// database, and reports what changed.
+    #[test]
+    fn reload_applies_new_settings_mid_session() {
+        let db_path = temp_db("reload");
+        let store = Store::open(&db_path).unwrap();
+        let config = AgentConfig {
+            flush_batch_size: 1,
+            cpu_spike_threshold_pct: 90.0,
+            eventlog_correlation: false,
+            ..AgentConfig::default()
+        };
+        let live = LiveSettings::new(&config);
+        let (tx, rx) = channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let core = {
+            let live = live.clone();
+            std::thread::spawn(move || run(store, rx, config, flag, live))
+        };
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Start { label: None, reply }).unwrap();
+        let session_id = reply_rx.recv().unwrap().unwrap();
+
+        let mut busy = sample(1);
+        busy.cpu_pct = 60.0;
+        tx.send(CoreMsg::Sample(busy.clone())).unwrap(); // under 90: no spike
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Reload {
+            config: Box::new(AgentConfig {
+                cpu_spike_threshold_pct: 50.0,
+                sample_interval_ms: 250,
+                db_path: "somewhere-else.db".into(),
+                flush_batch_size: 1,
+                eventlog_correlation: false,
+                ..AgentConfig::default()
+            }),
+            reply,
+        })
+        .unwrap();
+        let changes = reply_rx.recv().unwrap();
+        assert_eq!(
+            changes,
+            [
+                "cpu_spike_threshold_pct: 90.0 -> 50.0",
+                "sample_interval_ms: 1000 -> 250"
+            ],
+            "db_path must not be reported (or applied) as changed"
+        );
+        assert_eq!(live.sample_interval(), Duration::from_millis(250));
+
+        busy.ts = 2;
+        tx.send(CoreMsg::Sample(busy)).unwrap(); // over 50: spike
+
+        let (reply, reply_rx) = channel();
+        tx.send(CoreMsg::Stop { reply }).unwrap();
+        reply_rx.recv().unwrap().unwrap();
+        tx.send(CoreMsg::Shutdown).unwrap();
+        core.join().unwrap();
+
+        let reader = Store::open(&db_path).unwrap();
+        assert_eq!(reader.metrics_for_session(session_id).unwrap().len(), 2);
+        let events = reader.events_for_session(session_id).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!((events[0].kind.as_str(), events[0].ts), ("cpu_spike", 2));
+        drop(reader);
+        remove_db(&db_path);
+    }
+
     fn sample(ts: i64) -> MetricSample {
         MetricSample {
             ts,
@@ -293,6 +426,7 @@ mod tests {
             context_switches_per_sec: 0.0,
             page_faults_per_sec: 0.0,
             gpu_pct: None,
+            disk_queue_len: None,
             top_processes: Vec::new(),
         }
     }
@@ -316,7 +450,7 @@ mod tests {
 
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        let core = std::thread::spawn(move || run(store, rx, config, flag));
+        let core = std::thread::spawn(move || run_core(store, rx, config, flag));
 
         let (reply, reply_rx) = channel();
         tx.send(CoreMsg::Start { label: None, reply }).unwrap();
@@ -370,7 +504,7 @@ mod tests {
         };
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        let core = std::thread::spawn(move || run(store, rx, config, flag));
+        let core = std::thread::spawn(move || run_core(store, rx, config, flag));
 
         let (reply, reply_rx) = channel();
         tx.send(CoreMsg::Start { label: None, reply }).unwrap();
@@ -421,7 +555,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let core = {
             let flag = flag.clone();
-            std::thread::spawn(move || run(store, rx, config, flag))
+            std::thread::spawn(move || run_core(store, rx, config, flag))
         };
 
         let (reply, reply_rx) = channel();
@@ -499,7 +633,7 @@ mod tests {
 
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        let core = std::thread::spawn(move || run(store, rx, config, flag));
+        let core = std::thread::spawn(move || run_core(store, rx, config, flag));
 
         let (reply, reply_rx) = channel();
         tx.send(CoreMsg::Start { label: None, reply }).unwrap();
@@ -544,7 +678,7 @@ mod tests {
 
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        let core = std::thread::spawn(move || run(store, rx, config, flag));
+        let core = std::thread::spawn(move || run_core(store, rx, config, flag));
 
         let (reply, reply_rx) = channel();
         tx.send(CoreMsg::Start { label: None, reply }).unwrap();

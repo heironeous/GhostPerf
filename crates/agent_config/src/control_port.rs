@@ -12,7 +12,10 @@
 //! the tray and UI can find the agent. It changes on every agent start, so
 //! clients must re-read it each time they connect rather than caching it.
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn port_file_path() -> PathBuf {
     crate::data_dir().join("agent.port")
@@ -48,6 +51,29 @@ pub fn remove_port_file(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Client side of the agent's control channel (see `agent::ipc` for the
+/// server and protocol): one newline-terminated command per connection, one
+/// line of reply, then the connection closes. Here rather than in the tray
+/// because the UI sends `reload` too.
+pub fn send_command(port: u16, command: &str) -> anyhow::Result<String> {
+    let addr = ("127.0.0.1", port);
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve 127.0.0.1:{port}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+    writeln!(stream, "{command}")?;
+
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply.trim().to_string())
 }
 
 #[cfg(test)]
@@ -90,6 +116,29 @@ mod tests {
             std::fs::write(&path, contents).unwrap();
             assert_eq!(read_port_file(&path), None, "contents {contents:?}");
         }
+    }
+
+    #[test]
+    fn send_command_returns_the_trimmed_reply_line() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the whole command line before replying, as the real agent
+            // does: closing with unread data makes Windows reset the
+            // connection, failing the client's read (see the tray's
+            // `ipc_client` tests, where this first bit).
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            writeln!(stream, "OK echo {}", line.trim()).unwrap();
+        });
+        assert_eq!(send_command(port, "reload").unwrap(), "OK echo reload");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_command_fails_when_nothing_is_listening() {
+        assert!(send_command(1, "status").is_err());
     }
 
     #[test]

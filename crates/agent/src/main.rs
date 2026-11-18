@@ -7,6 +7,7 @@ mod core;
 mod eventlog;
 mod instance;
 mod ipc;
+mod live;
 mod platform;
 mod sampler;
 mod sampling_loop;
@@ -15,7 +16,7 @@ mod stall;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_config::AgentConfig;
 use anyhow::Context;
@@ -95,26 +96,30 @@ fn run() -> anyhow::Result<()> {
 
     let (core_tx, core_rx) = mpsc::channel();
     let recording_flag = Arc::new(AtomicBool::new(false));
+    // Shared with the sampler and stall threads so `reload` reaches them.
+    let live = live::LiveSettings::new(&config);
 
     let core_handle = {
         let config = config.clone();
         let recording_flag = recording_flag.clone();
-        std::thread::spawn(move || core::run(store, core_rx, config, recording_flag))
+        let live = live.clone();
+        std::thread::spawn(move || core::run(store, core_rx, config, recording_flag, live))
     };
 
     {
-        let sample_interval = Duration::from_millis(config.sample_interval_ms);
-        let top_n = config.top_n_processes;
         let recording_flag = recording_flag.clone();
         let core_tx = core_tx.clone();
+        let live = live.clone();
         std::thread::spawn(move || {
-            let mut sampler = sampler::Sampler::new(top_n);
-            sampling_loop::run(sample_interval, &recording_flag, |step| match step {
+            let mut sampler = sampler::Sampler::new(live.top_n_processes());
+            let interval = || live.sample_interval();
+            sampling_loop::run(interval, &recording_flag, |step| match step {
                 sampling_loop::Step::Prime => {
                     sampler.prime();
                     true
                 }
                 sampling_loop::Step::Sample => {
+                    sampler.set_top_n(live.top_n_processes());
                     let sample = sampler.sample(now_millis());
                     // Err: the core thread has shut down, so stop sampling.
                     core_tx.send(core::CoreMsg::Sample(sample)).is_ok()
@@ -131,9 +136,7 @@ fn run() -> anyhow::Result<()> {
     {
         let core_tx = core_tx.clone();
         let recording_flag = recording_flag.clone();
-        let check_interval = Duration::from_millis(config.stall_check_interval_ms);
-        let threshold = Duration::from_millis(config.stall_threshold_ms);
-        std::thread::spawn(move || stall::run(core_tx, recording_flag, check_interval, threshold));
+        std::thread::spawn(move || stall::run(core_tx, recording_flag, || live.stall_timing()));
     }
 
     // The control thread owns the shutdown path: once `core::run` returns

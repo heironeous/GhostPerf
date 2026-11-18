@@ -4,7 +4,9 @@ use storage::{Event, MetricSample, Session};
 use crate::app::Action;
 use crate::data::Db;
 use crate::export;
-use crate::format::{format_datetime, format_duration, format_mb, format_pct, format_rate};
+use crate::format::{
+    format_datetime, format_duration, format_mb, format_pct, format_queue, format_rate,
+};
 use crate::process_agg::aggregate_processes;
 
 /// One y-axis width (ui points) for every chart *and* the overview strip.
@@ -17,6 +19,37 @@ use crate::process_agg::aggregate_processes;
 /// `format` tests).
 const Y_AXIS_WIDTH: f32 = 72.0;
 const PLOT_HEIGHT: f32 = 140.0;
+const OVERVIEW_HEIGHT: f32 = 60.0;
+/// Width of the title column left of every plot. Fixed, and the same for
+/// all of them including the overview strip, for the same reason as
+/// `Y_AXIS_WIDTH`: the plots must start at the same x. Wide enough for the
+/// longest title ("Disk queue") on one line.
+const TITLE_WIDTH: f32 = 84.0;
+
+const DISK_QUEUE_HINT: &str = "Average number of disk requests waiting or in service, \
+    all physical disks. Sustained values above about 2 per disk mean I/O is backing up, \
+    even when the byte rates above look low.";
+
+/// Lays out one plot with its title in a column to its left, vertically
+/// centered, with `hint` on hover. The title used to be only the legend's
+/// series name, inside the plot's corner, which is easy to miss when
+/// scanning down the stack.
+fn titled(
+    ui: &mut egui::Ui,
+    title: &str,
+    hint: &str,
+    height: f32,
+    add_plot: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(TITLE_WIDTH, height),
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| ui.strong(title).on_hover_text(hint),
+        );
+        add_plot(ui);
+    });
+}
 
 /// Y grid step sizes for `egui_plot::uniform_grid_spacer`: the smallest of
 /// 1, 2, 10, 20, 100, 200, … that's at least `base_step_size` (the plot-unit
@@ -304,6 +337,11 @@ impl DetailView {
             .iter()
             .map(|m| [seconds_of(m.ts), m.net_tx_bps])
             .collect();
+        let disk_queue_points: Vec<[f64; 2]> = self
+            .metrics
+            .iter()
+            .filter_map(|m| Some([seconds_of(m.ts), m.disk_queue_len? as f64]))
+            .collect();
 
         let add_events = |plot_ui: &mut egui_plot::PlotUi| {
             for e in events {
@@ -335,27 +373,65 @@ impl DetailView {
                 .label_formatter(move |pos| hover_label(pos, fmt, &event_kinds))
         };
 
-        chart("cpu", format_pct).show(ui, |plot_ui| {
-            plot_ui.line(Line::new("CPU", cpu_points));
-            add_events(plot_ui);
-        });
-        let mem_kinds = event_kinds.clone();
-        chart("mem", format_pct)
-            .label_formatter(move |pos| mem_hover_label(pos, &mem_mb, &mem_kinds))
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new(MEM_SERIES, mem_points));
+        titled(ui, "CPU", "Whole-machine CPU use", PLOT_HEIGHT, |ui| {
+            chart("cpu", format_pct).show(ui, |plot_ui| {
+                plot_ui.line(Line::new("CPU", cpu_points));
                 add_events(plot_ui);
             });
-        chart("disk", format_rate).show(ui, |plot_ui| {
-            plot_ui.line(Line::new("Disk read", disk_read_points));
-            plot_ui.line(Line::new("Disk write", disk_write_points));
-            add_events(plot_ui);
         });
-        chart("net", format_rate).show(ui, |plot_ui| {
-            plot_ui.line(Line::new("Net rx", net_rx_points));
-            plot_ui.line(Line::new("Net tx", net_tx_points));
-            add_events(plot_ui);
-        });
+        let mem_kinds = event_kinds.clone();
+        titled(
+            ui,
+            "Memory",
+            "Memory in use, as a percentage of total (absolute figures on hover)",
+            PLOT_HEIGHT,
+            |ui| {
+                chart("mem", format_pct)
+                    .label_formatter(move |pos| mem_hover_label(pos, &mem_mb, &mem_kinds))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new(MEM_SERIES, mem_points));
+                        add_events(plot_ui);
+                    });
+            },
+        );
+        titled(
+            ui,
+            "Disk I/O",
+            "Bytes read and written per second, all processes",
+            PLOT_HEIGHT,
+            |ui| {
+                chart("disk", format_rate).show(ui, |plot_ui| {
+                    plot_ui.line(Line::new("Disk read", disk_read_points));
+                    plot_ui.line(Line::new("Disk write", disk_write_points));
+                    add_events(plot_ui);
+                });
+            },
+        );
+        // Sessions recorded before the queue length existed (or on a machine
+        // without the counter) have none, and an empty chart would only
+        // look like a recording fault.
+        if !disk_queue_points.is_empty() {
+            let disk_queue_points = PlotPoints::from(disk_queue_points);
+            titled(ui, "Disk queue", DISK_QUEUE_HINT, PLOT_HEIGHT, |ui| {
+                chart("disk_queue", format_queue).show(ui, |plot_ui| {
+                    plot_ui.line(Line::new("Disk queue", disk_queue_points));
+                    add_events(plot_ui);
+                });
+            });
+        }
+        titled(
+            ui,
+            "Network",
+            "Bytes received (rx) and sent (tx) per second, all adapters",
+            PLOT_HEIGHT,
+            |ui| {
+                chart("net", format_rate).show(ui, |plot_ui| {
+                    plot_ui.line(Line::new("Net rx", net_rx_points));
+                    plot_ui.line(Line::new("Net tx", net_tx_points));
+                    add_events(plot_ui);
+                });
+            },
+        );
 
         // Overview/selector strip: drag is reserved entirely for brush
         // selection (see `drag_start`/`selection`), so pan/zoom/box-zoom are
@@ -373,8 +449,19 @@ impl DetailView {
             .iter()
             .map(|m| [seconds_of(m.ts), m.cpu_pct as f64])
             .collect();
+        titled(
+            ui,
+            "Select",
+            "CPU over the whole session. Drag here to select a time range for the \
+             per-process table; double-click to clear it.",
+            OVERVIEW_HEIGHT,
+            |ui| self.overview(ui, overview_points),
+        );
+    }
+
+    fn overview(&mut self, ui: &mut egui::Ui, overview_points: PlotPoints) {
         let response = Plot::new(("overview", self.session.id))
-            .height(60.0)
+            .height(OVERVIEW_HEIGHT)
             .show_axes([true, true])
             .show_grid([true, false])
             .y_axis_min_width(Y_AXIS_WIDTH)

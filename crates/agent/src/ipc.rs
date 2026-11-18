@@ -14,7 +14,7 @@ pub fn bind() -> std::io::Result<TcpListener> {
 }
 
 /// Loopback-only control server. Accepts one newline-terminated command per
-/// connection (`start [label]`, `stop`, `status`, `shutdown`) and replies
+/// connection (`start [label]`, `stop`, `status`, `reload`, `shutdown`) and replies
 /// with a single line before closing. Binding to 127.0.0.1 keeps it off the
 /// network entirely — this is a same-machine control channel, not a remote API.
 pub fn serve(listener: TcpListener, core_tx: Sender<CoreMsg>) {
@@ -90,6 +90,35 @@ fn dispatch(line: &str, core_tx: &Sender<CoreMsg>) -> String {
                         .unwrap_or_else(|| "-".into()),
                     s.samples_buffered
                 ),
+                Err(_) => "ERR no reply from agent core".to_string(),
+            }
+        }
+        // Re-reads agent.toml and applies it to the running agent. A file
+        // that doesn't parse is refused, and the agent keeps its current
+        // settings rather than falling back to defaults.
+        "reload" => {
+            let path = agent_config::AgentConfig::default_config_path();
+            let config = match agent_config::AgentConfig::load_or_default(&path) {
+                Ok(config) => config,
+                Err(e) => {
+                    log::warn!("reload refused, {} unreadable: {e:#}", path.display());
+                    // TOML errors run over several lines (with a caret
+                    // under the bad spot), but a reply is exactly one line.
+                    let e = format!("{e:#}");
+                    let first_line = e.lines().next().unwrap_or_default();
+                    return format!("ERR {}: {first_line}", path.display());
+                }
+            };
+            let (reply, rx) = channel();
+            let msg = CoreMsg::Reload {
+                config: Box::new(config),
+                reply,
+            };
+            if core_tx.send(msg).is_err() {
+                return "ERR agent core unavailable".to_string();
+            }
+            match rx.recv() {
+                Ok(changes) => format!("OK reloaded changes={}", changes.len()),
                 Err(_) => "ERR no reply from agent core".to_string(),
             }
         }

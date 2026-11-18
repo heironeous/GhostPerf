@@ -73,6 +73,7 @@ pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Resul
         "context_switches_per_sec",
         "page_faults_per_sec",
         "gpu_pct",
+        "disk_queue_len",
         "top_processes",
     ])?;
     for m in metrics {
@@ -89,6 +90,7 @@ pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Resul
             m.context_switches_per_sec.to_string(),
             m.page_faults_per_sec.to_string(),
             m.gpu_pct.map_or_else(String::new, |v| v.to_string()),
+            m.disk_queue_len.map_or_else(String::new, |v| v.to_string()),
             serde_json::to_string(&m.top_processes)?,
         ])?;
     }
@@ -140,6 +142,7 @@ mod tests {
             context_switches_per_sec: 500.0,
             page_faults_per_sec: 10.0,
             gpu_pct: Some(33.0),
+            disk_queue_len: None,
             top_processes: vec![ProcessSample {
                 pid: 1,
                 name: "a.exe".into(),
