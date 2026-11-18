@@ -226,13 +226,24 @@ impl Store {
         Ok(())
     }
 
-    /// Closes any session left open (e.g. after an unclean shutdown) by
-    /// stamping it with `ended_at`, so the UI never shows a session that
-    /// looks like it's still running when the agent isn't.
-    pub fn close_orphaned_sessions(&self, ended_at: i64) -> Result<usize> {
+    /// Closes any session left open (e.g. after an unclean shutdown), so the
+    /// UI never shows a session that looks like it's still running when the
+    /// agent isn't.
+    ///
+    /// The end is the last thing the session recorded (a sample or an event),
+    /// or its start if nothing was flushed, not the time of this call. This
+    /// runs when the agent next starts, which after a power loss or a crash
+    /// of the whole machine can be hours later; stamping it then made the
+    /// session's duration include all that downtime.
+    pub fn close_orphaned_sessions(&self) -> Result<usize> {
         let n = self.conn.execute(
-            "UPDATE sessions SET ended_at = ?1 WHERE ended_at IS NULL",
-            params![ended_at],
+            "UPDATE sessions SET ended_at = MAX(
+                 started_at,
+                 COALESCE((SELECT MAX(ts) FROM metrics WHERE session_id = sessions.id), started_at),
+                 COALESCE((SELECT MAX(ts) FROM events WHERE session_id = sessions.id), started_at)
+             )
+             WHERE ended_at IS NULL",
+            [],
         )?;
         Ok(n)
     }
@@ -502,6 +513,16 @@ impl Store {
         }
         if deleted > 0 {
             self.conn.execute_batch("VACUUM")?;
+            // In WAL mode VACUUM's result lands in the -wal file, and the
+            // main file only shrinks at the next checkpoint. Left to SQLite
+            // that's the agent's exit or ~4 MB of further writes, so on
+            // Windows a 4.5 MB file stayed 4.5 MB on disk until the user
+            // quit. TRUNCATE also empties the -wal file. If a reader (the UI)
+            // holds an old snapshot, the checkpoint stops early and SQLite
+            // reports that as a result row, not an error; the next one
+            // finishes the job.
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         }
         Ok(deleted)
     }
@@ -584,8 +605,11 @@ mod tests {
         // row with no `ended_at`, exactly what `Store::open` on the next
         // agent start must find and close (see crates/agent/src/main.rs).
         let orphaned = store.start_session(3000, None, None).unwrap();
+        store
+            .insert_metrics_batch(orphaned, &[minimal_sample(4000), minimal_sample(5000)])
+            .unwrap();
 
-        let closed = store.close_orphaned_sessions(9999).unwrap();
+        let closed = store.close_orphaned_sessions().unwrap();
         assert_eq!(closed, 1, "only the orphaned session should be touched");
 
         assert_eq!(
@@ -595,12 +619,42 @@ mod tests {
         );
         assert_eq!(
             store.get_session(orphaned).unwrap().unwrap().ended_at,
-            Some(9999)
+            Some(5000),
+            "ends at its last sample, not whenever the agent came back"
         );
 
         // Idempotent: running it again (e.g. a second restart) with
         // nothing left open closes nothing.
-        assert_eq!(store.close_orphaned_sessions(99999).unwrap(), 0);
+        assert_eq!(store.close_orphaned_sessions().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_orphaned_session_ends_at_its_latest_sample_or_event_else_its_start() {
+        let store = Store::open(":memory:").unwrap();
+        let event = |ts| NewEvent {
+            ts,
+            kind: "stall".into(),
+            value: 120.0,
+            detail: None,
+        };
+        // A stall flushed after the last sample (the machine froze, then died).
+        let froze = store.start_session(1000, None, None).unwrap();
+        store
+            .insert_metrics_batch(froze, &[minimal_sample(2000)])
+            .unwrap();
+        store.insert_events_batch(froze, &[event(2500)]).unwrap();
+        // Crashed before anything was flushed.
+        let empty = store.start_session(3000, None, None).unwrap();
+
+        assert_eq!(store.close_orphaned_sessions().unwrap(), 2);
+        assert_eq!(
+            store.get_session(froze).unwrap().unwrap().ended_at,
+            Some(2500)
+        );
+        assert_eq!(
+            store.get_session(empty).unwrap().unwrap().ended_at,
+            Some(3000)
+        );
     }
 
     #[test]
@@ -836,6 +890,46 @@ mod tests {
             max_deleted_start < min_remaining_start,
             "every deleted session must be older than every surviving one"
         );
+    }
+
+    #[test]
+    fn prune_to_max_size_shrinks_the_file_on_disk_while_the_store_stays_open() {
+        let path = std::env::temp_dir().join(format!(
+            "ghostperf-prune-shrink-test-{}.db",
+            std::process::id()
+        ));
+        let cleanup = || {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        };
+        cleanup();
+        let store = Store::open(&path).unwrap();
+        for i in 0..10 {
+            let id = store.start_session(i * 10_000, None, None).unwrap();
+            let samples: Vec<_> = (0..500).map(|j| minimal_sample(i * 10_000 + j)).collect();
+            store.insert_metrics_batch(id, &samples).unwrap();
+            store.stop_session(id, i * 10_000 + 9_999).unwrap();
+        }
+        store
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let file_len = || std::fs::metadata(&path).unwrap().len();
+        let before = file_len();
+
+        assert!(store.prune_to_max_size(before / 4).unwrap() > 0);
+
+        // Checked with the store still open: closing it would checkpoint
+        // anyway and hide the bug.
+        assert!(
+            file_len() <= before / 4,
+            "file is {} bytes, cap {}",
+            file_len(),
+            before / 4
+        );
+        drop(store);
+        cleanup();
     }
 
     #[test]

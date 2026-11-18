@@ -49,6 +49,15 @@ pub fn log_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
+const DEFAULT_DB_FILE: &str = "ghostperf.db";
+
+/// Pure half of [`AgentConfig::resolved_db_path`]. `Path::join` with an
+/// absolute path returns that path unchanged, so an absolute `db_path` (one
+/// set by hand, or saved by an older version) is used as is.
+fn resolve_db_path(data_dir: &Path, db_path: &Path) -> PathBuf {
+    data_dir.join(db_path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Fields missing from an existing agent.toml (e.g. one written by an older
 // version before a setting existed) fall back to `Default` instead of failing
@@ -67,6 +76,13 @@ pub struct AgentConfig {
     pub flush_interval_ms: u64,
     /// Number of top CPU-consuming processes to snapshot each sample.
     pub top_n_processes: usize,
+    /// The SQLite database. A relative path (the default, `ghostperf.db`) is
+    /// relative to [`data_dir`]; read it through [`AgentConfig::resolved_db_path`].
+    /// It used to default to an absolute path, which `load_or_default` then
+    /// saved into `agent.toml` on first run, so a portable copy that was later
+    /// moved or copied elsewhere kept pointing at its *old* location: the
+    /// agent failed to start, or recorded into the original copy's database
+    /// if that still existed.
     pub db_path: PathBuf,
     /// How many days of completed sessions to retain before auto-pruning.
     pub retention_days: u32,
@@ -101,7 +117,7 @@ impl Default for AgentConfig {
             flush_batch_size: 30,
             flush_interval_ms: 10_000,
             top_n_processes: 5,
-            db_path: data_dir().join("ghostperf.db"),
+            db_path: PathBuf::from(DEFAULT_DB_FILE),
             retention_days: 30,
             retention_max_db_mb: None,
             stall_check_interval_ms: 15,
@@ -131,6 +147,11 @@ impl AgentConfig {
 
     pub fn default_config_path() -> PathBuf {
         data_dir().join("agent.toml")
+    }
+
+    /// Where the database actually is: `db_path` resolved against [`data_dir`].
+    pub fn resolved_db_path(&self) -> PathBuf {
+        resolve_db_path(&data_dir(), &self.db_path)
     }
 
     /// Writes this config back to `path` (e.g. after the UI's settings
@@ -226,6 +247,26 @@ retention_days = 30
         std::fs::write(dir.join("data"), b"not a directory").unwrap();
         let exe = dir.join("ghostperf-agent.exe");
         assert_eq!(portable_data_dir_in(&exe), None);
+    }
+
+    #[test]
+    fn default_db_path_is_saved_relative_so_a_moved_data_dir_follows() {
+        // What `load_or_default` writes on first run must not pin the
+        // database to the folder it was first run from.
+        let saved = toml::to_string_pretty(&AgentConfig::default()).unwrap();
+        let cfg: AgentConfig = toml::from_str(&saved).unwrap();
+        assert!(cfg.db_path.is_relative());
+        let moved = Path::new(r"E:\GhostPerf\data");
+        assert_eq!(
+            resolve_db_path(moved, &cfg.db_path),
+            moved.join("ghostperf.db")
+        );
+    }
+
+    #[test]
+    fn an_absolute_db_path_is_used_as_is() {
+        let abs = std::env::temp_dir().join("elsewhere").join("ghostperf.db");
+        assert_eq!(resolve_db_path(Path::new("unused"), &abs), abs);
     }
 
     #[test]

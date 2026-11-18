@@ -12,7 +12,8 @@
     After a release build, also produce dist\GhostPerf-portable-<version>.zip
     (the three exes plus an empty `data` folder — see
     crates/agent_config/src/lib.rs's portable-mode detection) and, if
-    `makensis` is on PATH, dist\GhostPerf-Setup-<version>.exe (installer\ghostperf.nsi).
+    NSIS is installed (`makensis` on PATH or in its default install folder),
+    dist\GhostPerf-Setup-<version>.exe (installer\ghostperf.nsi).
     Implies a release build; incompatible with -Debug.
 #>
 param(
@@ -102,15 +103,25 @@ try {
         # optional extra, not a build requirement) if NSIS isn't installed.
         # See AGENTS.md for installing it and for how this is verified
         # without a Windows machine.
-        $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+        # NSIS's own installer (and `winget install NSIS.NSIS`, which runs
+        # it) doesn't add itself to PATH, so also look where it installs by
+        # default; otherwise a machine with NSIS installed the normal way
+        # would still skip the installer.
+        $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Path
+        if (-not $makensis) {
+            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
         if ($makensis) {
             $nsiPath = Join-Path $repoRoot "installer\ghostperf.nsi"
-            & $makensis.Path "/DPRODUCT_VERSION=$version" $nsiPath
+            # The .nsi is UTF-8; without this makensis reads it in the ANSI
+            # code page and mangles any non-ASCII string (see the .nsi).
+            & $makensis /INPUTCHARSET UTF8 "/DPRODUCT_VERSION=$version" $nsiPath
             if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
             Write-Host "  $distDir\GhostPerf-Setup-$version.exe" -ForegroundColor Green
         }
         else {
-            Write-Warning "makensis not found on PATH; skipping the installer. Install NSIS (https://nsis.sourceforge.io/) to produce dist\GhostPerf-Setup-$version.exe too."
+            Write-Warning "makensis not found on PATH or in the default NSIS install folder; skipping the installer. Install NSIS (https://nsis.sourceforge.io/) to produce dist\GhostPerf-Setup-$version.exe too."
         }
     }
 }

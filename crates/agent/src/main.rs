@@ -47,6 +47,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let config_path = AgentConfig::default_config_path();
     let config = AgentConfig::load_or_default(&config_path)?;
+    let db_path = config.resolved_db_path();
 
     // Must come before opening the store: a second agent would otherwise
     // close the first one's in-progress session as "orphaned" below.
@@ -79,14 +80,14 @@ fn run() -> anyhow::Result<()> {
     })?;
     log::info!(
         "db={} control_port={} (written to {}) sample_interval_ms={}",
-        config.db_path.display(),
+        db_path.display(),
         control_port,
         port_file.display(),
         config.sample_interval_ms
     );
 
-    let store = Store::open(&config.db_path)?;
-    let closed = store.close_orphaned_sessions(now_millis())?;
+    let store = Store::open(&db_path)?;
+    let closed = store.close_orphaned_sessions()?;
     if closed > 0 {
         log::warn!("closed {closed} orphaned session(s) left open by a prior unclean exit");
     }

@@ -22,7 +22,7 @@ fn main() -> eframe::Result {
         agent_config::AgentConfig::default_config_path(),
     )
     .unwrap_or_default();
-    let db_path = config.db_path.clone();
+    let db_path = config.resolved_db_path();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

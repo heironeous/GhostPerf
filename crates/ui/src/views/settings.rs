@@ -85,7 +85,7 @@ impl SettingsView {
                 ui.end_row();
 
                 ui.label("Database location");
-                ui.label(self.config.db_path.display().to_string());
+                ui.label(self.config.resolved_db_path().display().to_string());
                 ui.end_row();
             });
 

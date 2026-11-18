@@ -1,7 +1,7 @@
 ; GhostPerf installer (NSIS). Part of Phase 5 — see TODO.md.
 ;
 ; Build with (after a release build has produced the three exes):
-;   makensis /DPRODUCT_VERSION=<version> installer\ghostperf.nsi
+;   makensis /INPUTCHARSET UTF8 /DPRODUCT_VERSION=<version> installer\ghostperf.nsi
 ; `build.ps1 -Package` does both steps. See AGENTS.md for how this is
 ; compile-checked (and, with a cross-compiled release build, fully built
 ; into a real installer.exe) without a Windows machine, since `makensis`
@@ -117,5 +117,8 @@ Section "Uninstall"
   ; Deliberately not removed: %APPDATA%\GhostPerf (config, database, logs)
   ; — uninstalling the program shouldn't silently delete recorded sessions
   ; the user might reinstall to get back to. The uninstaller tells them so.
-  MessageBox MB_OK "GhostPerf has been removed. Your recordings and settings in %APPDATA%\GhostPerf were kept — delete that folder by hand if you don't want them."
+  ; Keep strings ASCII: without /INPUTCHARSET UTF8 (build.ps1 passes it, a
+  ; hand-run makensis may not), makensis reads this file in the system's ANSI
+  ; code page, and a UTF-8 em dash here once showed up as "â€”".
+  MessageBox MB_OK "GhostPerf has been removed. Your recordings and settings in %APPDATA%\GhostPerf were kept. Delete that folder by hand if you don't want them."
 SectionEnd
