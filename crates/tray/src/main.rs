@@ -9,6 +9,7 @@ mod ipc_client;
 mod open_ui;
 mod paths;
 mod supervisor;
+mod welcome;
 
 use std::time::Duration;
 
@@ -123,6 +124,7 @@ fn run() -> anyhow::Result<()> {
         .with_tooltip("GhostPerf")
         .with_icon(icons::idle_icon())
         .build()?;
+    welcome::show_on_first_run(&tray);
 
     let mut recording = false;
     // Set once Quit starts stopping the agent. Poll ticks queued while Quit
