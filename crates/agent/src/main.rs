@@ -122,8 +122,17 @@ fn run() -> anyhow::Result<()> {
             // recording, or the overlay polled `live` recently enough that
             // its lease hasn't expired (see telemetry.rs). Neither reason
             // knows about the other; the sampler thread doesn't need to.
-            let active =
-                || recording_flag.load(Ordering::SeqCst) || telemetry.wants_samples(now_millis());
+            // While neither holds, the overlay's cached reading is dropped
+            // (see `Telemetry::sampler_idle`): this closure is what the loop
+            // checks every few ms while idle, so it's where idleness shows.
+            let active = || {
+                let active =
+                    recording_flag.load(Ordering::SeqCst) || telemetry.wants_samples(now_millis());
+                if !active {
+                    telemetry.sampler_idle();
+                }
+                active
+            };
             sampling_loop::run(interval, active, |step| match step {
                 sampling_loop::Step::Prime => {
                     sampler.prime();

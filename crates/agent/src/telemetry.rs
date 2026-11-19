@@ -69,6 +69,15 @@ impl Telemetry {
             Some(LiveSnapshot::from_sample(sample));
     }
 
+    /// Called by the sampler thread while it's idle: drops the latest
+    /// snapshot, since nothing will update it until sampling resumes. When
+    /// it was kept, the first Windows run found an overlay opened half a minute after
+    /// the last one closed showing that old reading as current until the
+    /// sampler had ticked again; `poll` now answers "no data yet" instead.
+    pub fn sampler_idle(&self) {
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Called by the `live` command handler: returns the latest snapshot
     /// (`None` if the sampler hasn't ticked since this call started
     /// sampling — ask again shortly) and refreshes the lease so the sampler
@@ -132,6 +141,16 @@ mod tests {
 
         t.publish(&sample(2000, 90.0));
         assert_eq!(t.poll(2000).unwrap().cpu_pct, 90.0);
+    }
+
+    #[test]
+    fn an_idle_sampler_leaves_no_reading_to_serve() {
+        let t = Telemetry::new();
+        t.publish(&sample(1000, 12.5));
+        t.sampler_idle();
+        assert_eq!(t.poll(40_000), None);
+        t.publish(&sample(41_000, 30.0));
+        assert_eq!(t.poll(41_000).unwrap().cpu_pct, 30.0);
     }
 
     #[test]

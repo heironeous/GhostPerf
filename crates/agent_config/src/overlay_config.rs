@@ -26,8 +26,10 @@ pub struct OverlayConfig {
     pub monitor_index: usize,
     /// Distance from the two edges of `corner`, in logical (DPI-independent) pixels.
     pub margin_px: f32,
-    /// 0.0 (invisible) to 1.0 (opaque).
-    pub opacity: f32,
+    /// 0.0 (invisible) to 1.0 (opaque). `f64`, not `f32`, because TOML
+    /// floats are 64-bit: an `f32` 0.85 was written to the generated
+    /// `overlay.toml` as `0.8500000238418579`.
+    pub opacity: f64,
     /// How often to poll the agent's `live` command and repaint.
     pub refresh_interval_ms: u64,
     /// Global hotkey that toggles the overlay on/off, in `global_hotkey`'s
@@ -35,6 +37,13 @@ pub struct OverlayConfig {
     /// (hand-edited) disables the hotkey rather than failing to start —
     /// the tray's menu item still toggles it.
     pub hotkey: String,
+    /// Where the overlay was last dragged to in edit mode ("Move Overlay"
+    /// in the tray): its top-left corner in logical px, on the whole
+    /// desktop rather than one monitor. When set, it replaces `corner`,
+    /// `monitor_index` and `margin_px`; delete the line to go back to them.
+    /// Ignored, with the corner used instead, if it's no longer on any
+    /// monitor (e.g. one that has since been unplugged).
+    pub position: Option<[f64; 2]>,
 }
 
 impl Default for OverlayConfig {
@@ -46,9 +55,16 @@ impl Default for OverlayConfig {
             opacity: 0.85,
             refresh_interval_ms: 500,
             hotkey: "Ctrl+Alt+O".to_string(),
+            position: None,
         }
     }
 }
+
+/// The commands the tray sends the overlay, one per line on its stdin: the
+/// tray launches the overlay and keeps the pipe, so this needs no port or
+/// file. Here so both ends spell them the same.
+pub const OVERLAY_EDIT_ON: &str = "edit on";
+pub const OVERLAY_EDIT_OFF: &str = "edit off";
 
 impl OverlayConfig {
     pub fn load_or_default(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -61,7 +77,7 @@ impl OverlayConfig {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, toml::to_string_pretty(&cfg)?)?;
+            std::fs::write(path, toml::to_string(&cfg)?)?;
             Ok(cfg)
         }
     }
@@ -75,7 +91,8 @@ impl OverlayConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        // Not `to_string_pretty`: it spreads `position = [x, y]` over four lines.
+        std::fs::write(path, toml::to_string(self)?)?;
         Ok(())
     }
 }
@@ -127,5 +144,26 @@ mod tests {
         assert_eq!(loaded.monitor_index, 1);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_saved_position_roundtrips_and_no_position_is_left_out() {
+        let text = toml::to_string(&OverlayConfig::default()).unwrap();
+        assert!(!text.contains("position"), "{text}");
+        assert_eq!(
+            toml::from_str::<OverlayConfig>(&text).unwrap().position,
+            None
+        );
+
+        let cfg = OverlayConfig {
+            position: Some([1520.0, 36.0]),
+            ..OverlayConfig::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("position = [1520.0, 36.0]"), "{text}");
+        assert_eq!(
+            toml::from_str::<OverlayConfig>(&text).unwrap().position,
+            Some([1520.0, 36.0])
+        );
     }
 }

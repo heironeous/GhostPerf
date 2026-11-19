@@ -5,8 +5,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod commands;
 mod live_reply;
-mod noactivate;
+mod native_window;
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::GlobalHotKeyManager;
@@ -52,11 +53,15 @@ fn main() -> eframe::Result {
         "GhostPerf Overlay",
         options,
         Box::new(move |cc| {
-            noactivate::apply(cc);
+            let window = native_window::NativeWindow::new(cc);
+            let commands = commands::listen(cc.egui_ctx.clone());
             Ok(Box::new(app::OverlayApp::new(
                 config,
+                config_path,
                 manager,
                 hotkey.map(|hk| hk.id()),
+                window,
+                commands,
             )))
         }),
     )

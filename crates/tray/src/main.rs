@@ -53,6 +53,15 @@ fn send_to_agent(port: Option<u16>, command: &str) {
     }
 }
 
+/// Sets a checkmark to `on` if it isn't already. The menu flips a
+/// checkmark itself when it's clicked, before the click is handled, so each
+/// handler sets it back to the real state afterwards.
+fn sync_check(item: &CheckMenuItem, on: bool) {
+    if item.is_checked() != on {
+        item.set_checked(on);
+    }
+}
+
 /// Sets the "Start with Windows" checkmark to what's actually registered.
 /// Left alone if the registry can't be read, rather than guessing.
 fn sync_autostart_check(item: &CheckMenuItem) {
@@ -116,7 +125,11 @@ fn run() -> anyhow::Result<()> {
     let start_item = MenuItem::new("Start recording", true, None);
     let stop_item = MenuItem::new("Stop recording", false, None);
     let open_ui_item = MenuItem::new("Open UI", true, None);
-    let overlay_item = MenuItem::new("Show Overlay", true, None);
+    // Checkmarks rather than a "Show"/"Hide" label that changes: ticked
+    // while the overlay is running, and while it's in edit mode (draggable
+    // rather than click-through).
+    let overlay_item = CheckMenuItem::new("Show Overlay", true, false, None);
+    let move_overlay_item = CheckMenuItem::new("Move Overlay", true, false, None);
     let mut overlay = overlay::OverlayHandle::new();
     let autostart_on = autostart::is_enabled().unwrap_or(false);
     let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart_on, None);
@@ -134,6 +147,7 @@ fn run() -> anyhow::Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&open_ui_item)?;
     menu.append(&overlay_item)?;
+    menu.append(&move_overlay_item)?;
     if offer_autostart {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&autostart_item)?;
@@ -205,11 +219,8 @@ fn run() -> anyhow::Result<()> {
                 // non-blocking `Child::try_wait`, not a process scan — see
                 // overlay.rs's module doc for why that's fine to do every
                 // poll tick, unlike the agent/UI checks above.
-                overlay_item.set_text(if overlay.is_running() {
-                    "Hide Overlay"
-                } else {
-                    "Show Overlay"
-                });
+                sync_check(&overlay_item, overlay.is_running());
+                sync_check(&move_overlay_item, overlay.is_editing());
                 None
             }
             _ => None,
@@ -248,15 +259,22 @@ fn run() -> anyhow::Result<()> {
         } else if menu_event.id() == overlay_item.id() {
             match overlay.toggle() {
                 Ok(running) => {
-                    log::info!("overlay {}", if running { "started" } else { "stopped" });
-                    overlay_item.set_text(if running {
-                        "Hide Overlay"
-                    } else {
-                        "Show Overlay"
-                    });
+                    log::info!("overlay {}", if running { "started" } else { "stopped" })
                 }
                 Err(e) => log::error!("failed to toggle the overlay: {e:#}"),
             }
+            sync_check(&overlay_item, overlay.is_running());
+            sync_check(&move_overlay_item, overlay.is_editing());
+        } else if menu_event.id() == move_overlay_item.id() {
+            // From the overlay's actual edit state, not the checkmark, for
+            // the same reason as "Start with Windows" below.
+            let on = !overlay.is_editing();
+            match overlay.set_editing(on) {
+                Ok(()) => log::info!("overlay edit mode {}", if on { "on" } else { "off" }),
+                Err(e) => log::error!("failed to switch overlay edit mode: {e:#}"),
+            }
+            sync_check(&overlay_item, overlay.is_running());
+            sync_check(&move_overlay_item, overlay.is_editing());
         } else if menu_event.id() == autostart_item.id() {
             // Flips what's registered, not what the checkmark now shows. The
             // menu toggles the checkmark itself on click, but a poll handled

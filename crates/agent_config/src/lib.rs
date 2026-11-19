@@ -9,7 +9,7 @@ mod overlay_config;
 pub use control_port::{
     port_file_path, read_port_file, remove_port_file, send_command, write_port_file,
 };
-pub use overlay_config::{OverlayConfig, OverlayCorner};
+pub use overlay_config::{OverlayConfig, OverlayCorner, OVERLAY_EDIT_OFF, OVERLAY_EDIT_ON};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

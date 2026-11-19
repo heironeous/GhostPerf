@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use agent_config::{OverlayConfig, OverlayCorner};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
+use crate::commands::Command;
 use crate::live_reply::{self, LiveReading};
+use crate::native_window::NativeWindow;
 
 /// Fixed logical size (DPI-independent egui points — see `OverlayConfig`'s
 /// doc on `margin_px`) for the small CPU/RAM/GPU readout. Not resizable:
@@ -15,7 +18,7 @@ pub const WINDOW_SIZE: (f32, f32) = (170.0, 78.0);
 /// The window TODO.md Phase 6 asks for: click-through (so it never steals
 /// input from the game), borderless, always-on-top, no taskbar entry.
 /// `mouse_passthrough` alone covers "never steals input" for clicks;
-/// [`crate::noactivate`] additionally stops it from ever taking focus
+/// [`crate::native_window`] additionally stops it from ever taking focus
 /// (activation), which nothing here covers — see that module.
 pub fn viewport(config: &OverlayConfig) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
@@ -28,11 +31,28 @@ pub fn viewport(config: &OverlayConfig) -> egui::ViewportBuilder {
         .with_mouse_passthrough(true)
         .with_active(false)
         .with_drag_and_drop(false)
-        // Best-effort initial spot; `OverlayApp::update_placement` moves it
-        // to the configured monitor/corner once real monitor info is
-        // available (see that method's doc comment).
-        .with_position(egui::pos2(config.margin_px, config.margin_px))
+        // The remembered position if there is one. Otherwise a best-effort
+        // initial spot; `OverlayApp::update_placement` moves it to the
+        // configured monitor/corner once real monitor info is available
+        // (see that method's doc comment).
+        .with_position(
+            saved_position(config).unwrap_or(egui::pos2(config.margin_px, config.margin_px)),
+        )
 }
+
+fn saved_position(config: &OverlayConfig) -> Option<egui::Pos2> {
+    config.position.map(|[x, y]| egui::pos2(x as f32, y as f32))
+}
+
+/// How long the window has to stay put after a drag before its position is
+/// written to `overlay.toml`. Waiting for the mouse button to come up
+/// instead isn't reliable: the OS's window-move loop that `StartDrag` hands
+/// the drag to swallows the button release, so egui may never see it.
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// Edit mode's outline and heading, so it's obvious the window can be
+/// grabbed and isn't click-through right now.
+const EDIT_ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 176, 32);
 
 enum Reading {
     NotRunning,
@@ -40,7 +60,15 @@ enum Reading {
     Live(LiveReading),
 }
 
+#[derive(Clone, Copy)]
 enum Placement {
+    /// Move to the remembered position (`OverlayConfig::position`). The
+    /// window was created there already, but this goes through the same
+    /// points-to-pixels conversion that saved it.
+    Saved,
+    /// Moved to the remembered position last frame: check it's on a monitor,
+    /// and fall back to the corner if not.
+    CheckSaved,
     /// Still trying to land on the configured monitor/corner. Retried
     /// every frame until it succeeds — the monitor info a freshly created
     /// window reports can be `None` for the first frame or two, and a
@@ -66,16 +94,34 @@ pub struct OverlayApp {
     /// not fatal (the tray's menu item still works).
     _hotkey_manager: Option<GlobalHotKeyManager>,
     hotkey_id: Option<u32>,
+    window: NativeWindow,
+    config_path: PathBuf,
+    commands: Receiver<Command>,
+    /// Edit mode: takes the mouse and can be dragged ("Move Overlay").
+    editing: bool,
+    /// Whether the window has been dragged in this edit mode. Without a
+    /// drag nothing is saved, so just switching edit mode on and off
+    /// doesn't pin the corner placement into `overlay.toml`.
+    dragged: bool,
+    /// In edit mode: the position seen last frame, and since when.
+    settle: Option<(egui::Pos2, Instant)>,
 }
 
 impl OverlayApp {
     pub fn new(
         config: OverlayConfig,
+        config_path: PathBuf,
         hotkey_manager: Option<GlobalHotKeyManager>,
         hotkey_id: Option<u32>,
+        window: NativeWindow,
+        commands: Receiver<Command>,
     ) -> Self {
-        let placement = Placement::Pending {
-            jump_sent: config.monitor_index == 0, // primary: no jump needed, so "already sent"
+        let placement = if config.position.is_some() {
+            Placement::Saved
+        } else {
+            Placement::Pending {
+                jump_sent: config.monitor_index == 0, // primary: no jump needed, so "already sent"
+            }
         };
         Self {
             placement,
@@ -85,7 +131,100 @@ impl OverlayApp {
             visible: true,
             _hotkey_manager: hotkey_manager,
             hotkey_id,
+            window,
+            config_path,
+            commands,
+            editing: false,
+            dragged: false,
+            settle: None,
             config,
+        }
+    }
+
+    /// In `logic`, like the hotkey, so a command reaches a hidden window too.
+    fn poll_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                Command::Edit(on) => self.set_editing(ctx, on),
+            }
+        }
+    }
+
+    fn set_editing(&mut self, ctx: &egui::Context, on: bool) {
+        if on == self.editing {
+            return;
+        }
+        self.editing = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!on));
+        if on && !self.visible {
+            // Hidden by the hotkey: there'd be nothing to drag.
+            self.visible = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        if !on {
+            if self.dragged {
+                if let Some(pos) = current_position(ctx) {
+                    self.save_position(pos);
+                }
+            }
+            self.dragged = false;
+            self.settle = None;
+        }
+        log::info!("edit mode {}", if on { "on" } else { "off" });
+    }
+
+    /// Writes `pos` to `overlay.toml` as the remembered position. Re-reads
+    /// the file first and changes only that line, so edits made by hand
+    /// since this overlay started are kept, and a file that no longer parses
+    /// is left alone rather than overwritten with defaults.
+    fn save_position(&mut self, pos: egui::Pos2) {
+        let position = [f64::from(pos.x.round()), f64::from(pos.y.round())];
+        if self.config.position == Some(position) {
+            return;
+        }
+        let path = &self.config_path;
+        let mut on_disk = match OverlayConfig::load_or_default(path) {
+            Ok(on_disk) => on_disk,
+            Err(e) => {
+                log::warn!(
+                    "position not saved: {} doesn't load ({e:#})",
+                    path.display()
+                );
+                return;
+            }
+        };
+        on_disk.position = Some(position);
+        match on_disk.save(path) {
+            Ok(()) => {
+                log::info!("position saved: {position:?}");
+                self.config.position = Some(position);
+            }
+            Err(e) => log::warn!("position not saved to {}: {e:#}", path.display()),
+        }
+    }
+
+    /// Edit mode, every frame: starts a drag on a click anywhere in the
+    /// window, and saves the position once a drag has come to rest.
+    fn handle_editing(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            // The OS's own window move, which keeps following the mouse
+            // even when it outruns the window.
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            self.dragged = true;
+            // The window hasn't moved yet when the press is seen: a still
+            // position timed from before it would save the old spot at once.
+            self.settle = None;
+        }
+        let Some(pos) = current_position(ctx) else {
+            return;
+        };
+        match self.settle {
+            Some((last, since)) if last == pos => {
+                if self.dragged && since.elapsed() >= SETTLE {
+                    self.save_position(pos);
+                }
+            }
+            _ => self.settle = Some((pos, Instant::now())),
         }
     }
 
@@ -111,6 +250,11 @@ impl OverlayApp {
 impl eframe::App for OverlayApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_hotkey(ctx);
+        self.poll_commands(ctx);
+        // After the hotkey and commands: showing the window again, and
+        // switching mouse passthrough, are changes after which winit resets
+        // the extended style.
+        self.window.ensure(self.editing);
         // Still cheap while hidden: just the hotkey channel above, no
         // polling the agent or painting. See TODO.md Phase 6's footprint
         // requirement.
@@ -122,20 +266,46 @@ impl eframe::App for OverlayApp {
         self.poll_hotkey(&ctx);
         self.update_placement(&ctx);
         self.maybe_poll();
+        // Here rather than in `logic`: only while visible, at the refresh
+        // rate, so a newly activated topmost window covers it for at most
+        // one refresh interval.
+        self.window.raise();
+        if self.editing {
+            self.handle_editing(&ctx);
+        }
         // Only repaint on the configured cadence, not continuously — this
         // is most of what keeps an always-running overlay's footprint
         // negligible (TODO.md Phase 6), the same technique already used
         // for the UI and tray's idle cost.
         ctx.request_repaint_after(self.refresh_interval());
 
+        // egui labels are selectable by default, which shows a text cursor
+        // over them in edit mode, as if a press would select text, when a
+        // press anywhere drags the window. Nothing here is worth copying.
+        ui.style_mut().interaction.selectable_labels = false;
+
         let alpha = (self.config.opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        let whole_window = ui.max_rect();
+        let editing = self.editing;
         egui::Frame::NONE
             .fill(egui::Color32::from_black_alpha(
                 (alpha as u16 * 180 / 255) as u8,
             ))
             .inner_margin(8.0)
             .show(ui, |ui| {
+                // The background covers the whole window, not just the text:
+                // sized to its content, it stopped short of the window's
+                // right and bottom edges, leaving a ragged box in the corner.
+                ui.set_min_size(ui.available_size());
                 let text = egui::Color32::from_white_alpha(alpha);
+                if editing {
+                    // In place of the readout, so the window keeps its size
+                    // and the position saved is the one it'll have locked.
+                    ui.colored_label(EDIT_ACCENT, egui::RichText::new("Drag to move").strong());
+                    ui.colored_label(text, "Untick \"Move Overlay\"");
+                    ui.colored_label(text, "in the tray to lock");
+                    return;
+                }
                 match &self.reading {
                     Reading::NotRunning => {
                         ui.colored_label(text, "GhostPerf agent not running");
@@ -162,7 +332,19 @@ impl eframe::App for OverlayApp {
                     }
                 }
             });
+        if editing {
+            ui.painter().rect_stroke(
+                whole_window,
+                0.0,
+                egui::Stroke::new(2.0, EDIT_ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
+}
+
+fn current_position(ctx: &egui::Context) -> Option<egui::Pos2> {
+    ctx.input(|i| i.viewport().outer_rect).map(|rect| rect.min)
 }
 
 impl OverlayApp {
@@ -196,17 +378,39 @@ impl OverlayApp {
     /// before `place_in_corner` moves and sizes it properly. Unverified
     /// cross-platform — see TODO.md Phase 6.
     fn update_placement(&mut self, ctx: &egui::Context) {
-        let Placement::Pending { jump_sent } = &mut self.placement else {
-            return;
-        };
-        if !*jump_sent {
-            ctx.send_viewport_cmd(egui::ViewportCommand::SetMonitor(self.config.monitor_index));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            *jump_sent = true;
-            return; // give the jump a frame to land before trusting monitor_size
-        }
-        if self.place_in_corner(ctx) {
-            self.placement = Placement::Done;
+        match self.placement {
+            Placement::Done => {}
+            Placement::Saved => {
+                if let Some(pos) = saved_position(&self.config) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
+                self.placement = Placement::CheckSaved;
+            }
+            Placement::CheckSaved => {
+                self.placement = if self.window.on_screen() == Some(false) {
+                    log::warn!(
+                        "saved position {:?} isn't on any monitor; using the {:?} corner",
+                        self.config.position,
+                        self.config.corner
+                    );
+                    Placement::Pending {
+                        jump_sent: self.config.monitor_index == 0,
+                    }
+                } else {
+                    Placement::Done
+                };
+            }
+            Placement::Pending { jump_sent: false } => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::SetMonitor(self.config.monitor_index));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                // Give the jump a frame to land before trusting monitor_size.
+                self.placement = Placement::Pending { jump_sent: true };
+            }
+            Placement::Pending { jump_sent: true } => {
+                if self.place_in_corner(ctx) {
+                    self.placement = Placement::Done;
+                }
+            }
         }
     }
 

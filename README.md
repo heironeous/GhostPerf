@@ -13,7 +13,7 @@ Four binaries, one shared storage format, talking over a local loopback TCP cont
 | Crate | Binary | What it is |
 |---|---|---|
 | `crates/agent` | `ghostperf-agent` | Background collector: samples metrics, detects stalls/spikes, writes to SQLite. Runs the control server. |
-| `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI", "Show/Hide Overlay". |
+| `crates/tray` | `ghostperf-tray` | System tray icon: start/stop recording, shows idle/recording state, launches the agent if it isn't running and relaunches it if it crashes, autostart toggle, "Open UI", "Show Overlay"/"Move Overlay". |
 | `crates/ui` | `ghostperf-ui` | Session viewer: list recorded sessions, chart CPU/mem/disk/net with event markers, drill into per-process stats, rename/delete/export, and a settings screen — see "Using the UI" below. |
 | `crates/overlay` | `ghostperf-overlay` | Click-through, always-on-top in-game readout of live CPU/RAM/GPU — see "Using the overlay" below. |
 | `crates/storage` | (lib) | SQLite schema + queries, shared by `agent` and `ui`. |
@@ -84,9 +84,11 @@ Launch `ghostperf-ui` directly, or click "Open UI" in the tray menu, which bring
 
 ## Using the overlay
 
-Click "Show Overlay" in the tray menu (it relabels to "Hide Overlay" while it's running — this is a real start/stop toggle, not launch-or-focus like "Open UI"). It shows live CPU/RAM/GPU numbers in a small, click-through, always-on-top window with no border or taskbar entry, so it never steals input or focus from whatever's running underneath it — including a game. It doesn't need a recording session running: it polls the agent's `live` command directly (see `TODO.md` Phase 6), which makes the sampler tick on its own while anything is actually asking for live numbers, and goes back to idle a few seconds after you stop.
+Tick "Show Overlay" in the tray menu (ticked while it's running; unticking closes it — a real start/stop toggle, not launch-or-focus like "Open UI"). It shows live CPU/RAM/GPU numbers in a small, click-through, always-on-top window with no border, taskbar button or Alt-Tab entry, so it never steals input or focus from whatever's running underneath it — including a game. It stays on top of borderless/windowed-fullscreen games, including ones whose own window is always-on-top; it can't draw over a game in *exclusive* fullscreen, so switch the game to borderless fullscreen to see it. It doesn't need a recording session running: it polls the agent's `live` command directly (see `TODO.md` Phase 6), which makes the sampler tick on its own while anything is actually asking for live numbers, and goes back to idle a few seconds after you stop.
 
 Once it's running, the configured global hotkey (`Ctrl+Alt+O` by default) shows/hides it instantly without relaunching — handy for toggling it off for a screenshot or a menu, then back on. Position (which corner, which monitor, margin), opacity, and refresh rate live in `overlay.toml` next to `agent.toml` (`OverlayConfig` in `crates/agent_config/src/overlay_config.rs`; no settings-screen UI for it yet, hand-edit the file and restart the overlay to pick up changes).
+
+To put it somewhere else, tick "Move Overlay" in the tray menu (it starts the overlay if needed). It gets an orange outline and can be dragged with the mouse; untick "Move Overlay" to lock it there, click-through again. The spot is saved to `overlay.toml` as `position = [x, y]` and used on every start instead of the corner; delete that line to go back to the corner.
 
 Targeting a monitor other than the first one, and drawing over genuine exclusive-fullscreen games (rather than the borderless/windowed-fullscreen most games default to today) are both best-effort — see the caveats in `TODO.md` Phase 6. There's no live FPS counter yet; that needs its own follow-up (also detailed there).
 
