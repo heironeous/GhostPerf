@@ -8,7 +8,7 @@ name = "ghostperf-ui"
 path = "src/main.rs"
 
 [dependencies]
-agent_config = { version = "0.1.0", path = "../agent_config" }
+agent_config = { path = "../agent_config" }
 anyhow = "1.0.104"
 chrono = "0.4.45"
 csv = "1.4.0"
@@ -17,11 +17,11 @@ egui = "0.37.0"
 egui_extras = "0.37.0"
 egui_plot = "0.38.0"
 log = "0.4.35"
-logging = { version = "0.1.0", path = "../logging" }
+logging = { path = "../logging" }
 raw-window-handle = "0.6.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-storage = { version = "0.1.0", path = "../storage" }
+storage = { path = "../storage" }
 
 # Embeds assets/icon/ghostperf-ui.ico into the exe (see build.rs).
 [target.'cfg(windows)'.build-dependencies]

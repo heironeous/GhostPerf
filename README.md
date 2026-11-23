@@ -55,6 +55,24 @@ Produces, in `dist\`:
 - `GhostPerf-portable-<version>.zip` — the four exes plus an empty `data` folder. Unzip anywhere and run `ghostperf-tray.exe`; that folder's presence (not a flag) is what makes config/database/logs live next to the exe instead of `%APPDATA%\GhostPerf` — no installer, no registry entries, no autostart (the tray doesn't offer "Start with Windows" in a portable copy). Delete the `data` folder to switch that copy back to installed-style behavior. The folder can be moved or copied elsewhere (another drive, a USB stick) and keeps working with its recordings.
 - `GhostPerf-Setup-<version>.exe` — an NSIS installer (`installer/ghostperf.nsi`), only if [NSIS](https://nsis.sourceforge.io/) is installed (`makensis` on `PATH`, or in NSIS's default install folder, where `winget install NSIS.NSIS` puts it without adding it to `PATH`); skipped with a warning otherwise. Installs per-user under `%LocalAppData%\Programs\GhostPerf` (no admin prompt), adds Start Menu shortcuts, registers autostart (the same `HKCU\...\Run` entry the tray's own "Start with Windows" checkbox manages, so either one can toggle it off), and ships an uninstaller that removes all of that but leaves `%APPDATA%\GhostPerf` (your recordings) alone.
 
+## Releases (CI)
+
+`.github/workflows/release.yml` runs on GitHub's Windows runners:
+
+- **Push to `main`**: checks formatting, then runs `./build.ps1 -Test -Package`. If that passes, it tags the commit `vX.Y.Z` and publishes a GitHub release with both `GhostPerf-Setup-X.Y.Z.exe` and `GhostPerf-portable-X.Y.Z.zip` attached. A push that changes only docs (`*.md` anywhere, `docs/`, `LICENSE*`) doesn't run it.
+- **Pull request to `main`**: the same build, test and package, with no tag or release. The packages are kept as a workflow artifact.
+- **Manual run** (Actions → Build & Release → Run workflow): releases the branch it's run on (only `main` releases), with a choice of which version part to bump.
+
+Versions follow semantic versioning. The commit messages since the last tag decide the bump (`.github/scripts/next-version.ps1`):
+
+| Bump | Write this in any commit message since the last release |
+|---|---|
+| major (`1.4.2` → `2.0.0`) | `#major`, `BREAKING CHANGE:`, or a Conventional Commits `!` (`feat!: …`, `fix(ui)!: …`) |
+| minor (`1.4.2` → `1.5.0`) | `#minor`, or a Conventional Commits `feat: …` / `feat(scope): …` |
+| patch (`1.4.2` → `1.4.3`) | anything else (the default) |
+
+Git tags are the record of released versions. CI writes the new version into its own copy of `Cargo.toml` before building, so the exes' version info, the installer and the file names all match the tag, but it doesn't commit that back. The `version` in `Cargo.toml` is therefore a floor: the first release uses it as is, and setting it above the latest tag (say to `1.0.0`) makes the next release exactly that version. Local builds keep reporting the `Cargo.toml` version.
+
 ## Running
 
 1. Start `ghostperf-tray` (the agent doesn't need to be started separately — the tray launches it if it isn't already running, and relaunches it if it crashes).

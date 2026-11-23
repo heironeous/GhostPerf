@@ -1,0 +1,167 @@
+# Build, test and package GhostPerf on Windows; on a push to main, also tag
+# the commit with the next semantic version and publish a GitHub release
+# carrying both the installer and the portable zip.
+#
+# Versioning rules (patch by default, #minor / #major or Conventional Commits
+# feat: / feat!: in a commit message to bump further) live in
+# .github/scripts/next-version.ps1. See README.md "Releases".
+
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    # A push touching only these doesn't build or release anything. GitHub
+    # skips the run only if *every* changed file matches, so a push mixing
+    # docs and code still releases.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version part to bump (auto = decide from commit messages)"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+# Releases run one at a time and never get cancelled: two pushes landing close
+# together must each see the other's tag, or both would claim the same
+# version. (GitHub keeps at most one *pending* run per group, so with three
+# quick pushes the middle one is skipped; that's fine, the last run releases
+# everything since the previous tag.) Pull request runs can just be
+# superseded by a newer push.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'release-main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build${{ github.event_name != 'pull_request' && ' & release' || '' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write # push the tag and create the release
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      IS_RELEASE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history and tags: the next version is derived from the latest
+          # vX.Y.Z tag and the commit messages since it.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Before the version stamp below, so the cache key isn't affected by it.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute version
+        id: version
+        if: env.IS_RELEASE == 'true'
+        env:
+          BUMP: ${{ github.event.inputs.bump || 'auto' }}
+        run: ./.github/scripts/next-version.ps1 -Bump $env:BUMP -Ref $env:GITHUB_SHA -Apply
+
+      # Phase 5's build.ps1 only warns when NSIS is missing; a release must
+      # have the installer, so make sure it's there (and fail below if not).
+      - name: Ensure NSIS
+        run: |
+          $found = (Get-Command makensis -ErrorAction SilentlyContinue) -or
+              (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe") -or
+              (Test-Path "$env:ProgramFiles\NSIS\makensis.exe")
+          if (-not $found) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed with exit code $LASTEXITCODE" }
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build, test and package
+        run: ./build.ps1 -Test -Package
+
+      - name: Collect packages
+        id: packages
+        run: |
+          # build.ps1 names both after Cargo.toml's (possibly just-stamped) version.
+          $setup = @(Get-ChildItem dist -Filter "GhostPerf-Setup-*.exe")
+          $zip = @(Get-ChildItem dist -Filter "GhostPerf-portable-*.zip")
+          if ($setup.Count -ne 1) { throw "expected exactly one installer in dist\, found $($setup.Count)" }
+          if ($zip.Count -ne 1) { throw "expected exactly one portable zip in dist\, found $($zip.Count)" }
+          "setup=$($setup[0].FullName)" >> $env:GITHUB_OUTPUT
+          "zip=$($zip[0].FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Installer: $($setup[0].Name)"
+          Write-Host "Portable:  $($zip[0].Name)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GhostPerf-${{ steps.version.outputs.version || github.sha }}
+          path: |
+            ${{ steps.packages.outputs.setup }}
+            ${{ steps.packages.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Tag
+        if: env.IS_RELEASE == 'true' && steps.version.outputs.existing != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a $env:TAG $env:GITHUB_SHA -m "GhostPerf $env:TAG"
+          git push origin "refs/tags/$env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw "pushing tag $env:TAG failed" }
+
+      - name: Publish release
+        if: env.IS_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SETUP: ${{ steps.packages.outputs.setup }}
+          ZIP: ${{ steps.packages.outputs.zip }}
+        run: |
+          # A re-run of a release whose tag (and maybe release) already exist:
+          # replace the assets instead of failing on "already exists".
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:SETUP $env:ZIP --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            exit 0
+          }
+
+          $setupName = Split-Path $env:SETUP -Leaf
+          $zipName = Split-Path $env:ZIP -Leaf
+          $notes = @"
+          ## Downloads
+
+          - **$setupName**: installer. Installs per-user under ``%LocalAppData%\Programs\GhostPerf`` (no admin prompt), adds Start Menu shortcuts and starts GhostPerf with Windows. The uninstaller keeps your recordings in ``%APPDATA%\GhostPerf``.
+          - **$zipName**: portable. Unzip anywhere and run ``ghostperf-tray.exe``. Config, recordings and logs stay in the ``data`` folder next to it; nothing is written to the registry.
+
+          "@
+          $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          Set-Content -Path $notesFile -Value $notes -Encoding utf8
+
+          gh release create $env:TAG $env:SETUP $env:ZIP `
+            --verify-tag `
+            --title "GhostPerf $env:VERSION" `
+            --notes-file $notesFile `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

@@ -8,13 +8,13 @@ name = "ghostperf-overlay"
 path = "src/main.rs"
 
 [dependencies]
-agent_config = { version = "0.1.0", path = "../agent_config" }
+agent_config = { path = "../agent_config" }
 anyhow = "1.0.104"
 eframe = "0.37.0"
 egui = "0.37.0"
 global-hotkey = "0.10.0"
 log = "0.4.35"
-logging = { version = "0.1.0", path = "../logging" }
+logging = { path = "../logging" }
 
 # Embeds assets/icon/ghostperf.ico into the exe (see build.rs) — the overlay
 # reuses the main brand icon rather than a new one, since it has no
