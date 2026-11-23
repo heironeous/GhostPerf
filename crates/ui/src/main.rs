@@ -28,6 +28,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 820.0])
             .with_icon(icon::viewport_icon()),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
 
@@ -39,4 +40,24 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::GhostPerfApp::new(db_path)))
         }),
     )
+}
+
+/// DX12 (GL as a fallback) on Windows instead of wgpu's default, which
+/// tries Vulkan first. Some Intel iGPU Vulkan drivers (`igvk64.dll`
+/// 30.0.101.1122, Intel UHD Graphics device 0x9B41) segfault while the surface is being
+/// created. That native crash kills the process before any Rust panic hook can log it, so
+/// the window just never appears. DX12 is the native API and is present on
+/// every supported Windows. `WGPU_BACKEND` still overrides this, e.g. to
+/// compare against Vulkan. The overlay does the same (`crates/overlay/src/main.rs`).
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
+    use eframe::wgpu;
+
+    let mut config = WgpuConfiguration::default();
+    if cfg!(windows) && wgpu::Backends::from_env().is_none() {
+        if let WgpuSetup::CreateNew(create_new) = &mut config.wgpu_setup {
+            create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::GL;
+        }
+    }
+    config
 }

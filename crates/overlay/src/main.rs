@@ -46,6 +46,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: app::viewport(&config),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
 
@@ -65,6 +66,30 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+/// DX12 instead of wgpu's Vulkan-first default on Windows, for the same
+/// driver-crash reason as `crates/ui/src/main.rs::wgpu_options` (read that
+/// first). This version has one more requirement: DX12's default swapchain
+/// is made straight from the HWND, and that kind has no transparent
+/// `CompositeAlphaMode`. The overlay would render opaque, which is why a
+/// Phase 6 note in TODO.md ruled DX12 out. A DirectComposition-visual
+/// swapchain does support transparency.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
+    use eframe::wgpu;
+
+    let mut config = WgpuConfiguration::default();
+    if cfg!(windows) {
+        if let WgpuSetup::CreateNew(create_new) = &mut config.wgpu_setup {
+            let desc = &mut create_new.instance_descriptor;
+            if wgpu::Backends::from_env().is_none() {
+                desc.backends = wgpu::Backends::DX12 | wgpu::Backends::GL;
+            }
+            desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
+    }
+    config
 }
 
 /// `None` (hotkey disabled, not fatal) for an empty or unparsable string —
