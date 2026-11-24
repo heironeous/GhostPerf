@@ -80,6 +80,20 @@ impl SettingsView {
                 );
                 ui.end_row();
 
+                ui.label("GPU temperature threshold (°C)");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.gpu_temp_threshold_c).range(30.0..=120.0),
+                );
+                ui.end_row();
+
+                ui.label("Board temperature threshold (°C)")
+                    .on_hover_text("For ACPI thermal zones: a motherboard or chassis sensor");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.board_temp_threshold_c)
+                        .range(30.0..=120.0),
+                );
+                ui.end_row();
+
                 ui.label("Windows Event Log correlation");
                 ui.checkbox(&mut self.config.eventlog_correlation, "enabled");
                 ui.end_row();

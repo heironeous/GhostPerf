@@ -140,6 +140,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: procs,
         }
     }

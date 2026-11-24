@@ -108,6 +108,13 @@ pub struct AgentConfig {
     /// A sample with memory utilization (`mem_used_mb` / total) at or above
     /// this is recorded as a `mem_spike` event.
     pub mem_spike_threshold_pct: f32,
+    /// A GPU reaching this temperature (°C) is recorded as a `temp_spike`
+    /// event. The default sits just above where current GPUs start holding
+    /// their clocks back (the RTX 3060 Ti's driver reports 83 °C as its
+    /// warning temperature, 93 °C as its maximum).
+    pub gpu_temp_threshold_c: f32,
+    /// The same for an ACPI thermal zone (a motherboard or chassis sensor).
+    pub board_temp_threshold_c: f32,
     /// Whether to correlate Windows Event Log entries (System/Application,
     /// Warning and above) into a session's events when it stops. No-op on
     /// non-Windows builds.
@@ -128,6 +135,8 @@ impl Default for AgentConfig {
             stall_threshold_ms: 50,
             cpu_spike_threshold_pct: 90.0,
             mem_spike_threshold_pct: 90.0,
+            gpu_temp_threshold_c: 85.0,
+            board_temp_threshold_c: 80.0,
             eventlog_correlation: true,
         }
     }

@@ -19,6 +19,10 @@ use windows::Win32::System::Threading::{
     GetProcessHandleCount, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use storage::{CpuPerf, SensorKind, TempReading};
+
+use super::thermal;
+use super::windows_gpu::GpuTemps;
 use super::SystemCounters;
 
 fn wide(s: &str) -> Vec<u16> {
@@ -48,6 +52,14 @@ pub struct PlatformCounters {
     /// (`diskperf -n`, or a damaged perf counter registry); best-effort
     /// like the GPU counter.
     disk_queue_counter: Option<PDH_HCOUNTER>,
+    /// ACPI thermal zones (every instance), and the divisor that turns the
+    /// counter into kelvins: 10 for `High Precision Temperature` (tenths of a
+    /// kelvin), 1 for the older whole-kelvin `Temperature`.
+    thermal_zone_counter: Option<(PDH_HCOUNTER, f64)>,
+    /// `Processor Information(_Total)`: `Actual Frequency`, `% Processor
+    /// Performance`, `% Performance Limit`, `Performance Limit Flags`.
+    cpu_perf_counters: Option<[PDH_HCOUNTER; 4]>,
+    gpu_temps: GpuTemps,
     /// Refreshed once per `sample_system` call via a single toolhelp
     /// snapshot, so per-process `thread_count` lookups are free instead of
     /// costing a syscall per process.
@@ -83,6 +95,30 @@ impl PlatformCounters {
             let disk_queue_counter =
                 add_optional_counter(query, r"\PhysicalDisk(_Total)\Avg. Disk Queue Length");
 
+            // Only the whole-kelvin `Temperature` exists on older Windows.
+            let thermal_zone_counter = add_optional_counter(
+                query,
+                r"\Thermal Zone Information(*)\High Precision Temperature",
+            )
+            .map(|c| (c, 10.0))
+            .or_else(|| {
+                add_optional_counter(query, r"\Thermal Zone Information(*)\Temperature")
+                    .map(|c| (c, 1.0))
+            });
+            // All or nothing: the four come from one counter set, and
+            // `CpuPerf` is only meaningful with all of them.
+            let cpu_perf_counters = [
+                r"\Processor Information(_Total)\Actual Frequency",
+                r"\Processor Information(_Total)\% Processor Performance",
+                r"\Processor Information(_Total)\% Performance Limit",
+                r"\Processor Information(_Total)\Performance Limit Flags",
+            ]
+            .map(|path| add_optional_counter(query, path));
+            let cpu_perf_counters = match cpu_perf_counters {
+                [Some(a), Some(b), Some(c), Some(d)] => Some([a, b, c, d]),
+                _ => None,
+            };
+
             // Rate and average counters (`/sec`, GPU utilization, average
             // disk queue length) need two collections
             // before they can format a value. Prime the query now so the
@@ -95,6 +131,9 @@ impl PlatformCounters {
                 pgfault_counter,
                 gpu_counter,
                 disk_queue_counter,
+                thermal_zone_counter,
+                cpu_perf_counters,
+                gpu_temps: GpuTemps::new(),
                 thread_cache: HashMap::new(),
             }
         }
@@ -113,6 +152,10 @@ impl PlatformCounters {
             .and_then(|c| self.read_double(c))
             .map(|v| v as f32);
 
+        let mut temps = self.gpu_temps.read();
+        temps.extend(self.read_thermal_zones());
+        let cpu_perf = self.read_cpu_perf();
+
         self.refresh_thread_cache();
 
         SystemCounters {
@@ -120,7 +163,41 @@ impl PlatformCounters {
             page_faults_per_sec,
             gpu_pct,
             disk_queue_len,
+            temps,
+            cpu_perf,
         }
+    }
+
+    /// Every ACPI thermal zone Windows exposes, as a `Board` sensor. Often a
+    /// fixed placeholder rather than a real sensor: on the dev machine (MSI
+    /// Z690) the one zone reads exactly 301.0 K (27.85 °C) whatever the load.
+    /// There's no telling from here, so it's recorded as reported and the UI
+    /// points out a zone that never changes.
+    fn read_thermal_zones(&self) -> Vec<TempReading> {
+        let Some((counter, divisor)) = self.thermal_zone_counter else {
+            return Vec::new();
+        };
+        self.read_array(counter)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(instance, value)| {
+                Some(TempReading {
+                    sensor: thermal::acpi_sensor_name(&instance),
+                    kind: SensorKind::Board,
+                    celsius: thermal::plausible(thermal::kelvin_to_celsius(value / divisor))?,
+                })
+            })
+            .collect()
+    }
+
+    fn read_cpu_perf(&self) -> Option<CpuPerf> {
+        let [freq, perf, limit, flags] = self.cpu_perf_counters?;
+        Some(CpuPerf {
+            freq_mhz: self.read_double(freq)? as f32,
+            perf_pct: self.read_double(perf)? as f32,
+            limit_pct: self.read_double(limit)? as f32,
+            limit_flags: self.read_double(flags)? as u32,
+        })
     }
 
     fn read_double(&self, counter: PDH_HCOUNTER) -> Option<f64> {
@@ -136,6 +213,13 @@ impl PlatformCounters {
     /// usage" counter, so this sums engines and clamps — an approximation,
     /// not an exact figure.
     fn read_gpu_array(&self, counter: PDH_HCOUNTER) -> Option<f32> {
+        let sum: f64 = self.read_array(counter)?.iter().map(|(_, v)| v).sum();
+        Some(sum.min(100.0) as f32)
+    }
+
+    /// `(instance name, value)` for every instance of a wildcard counter
+    /// that has a valid value this collection.
+    fn read_array(&self, counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
         unsafe {
             let mut buffer_size: u32 = 0;
             let mut item_count: u32 = 0;
@@ -163,13 +247,21 @@ impl PlatformCounters {
                 return None;
             }
 
+            // The names point into `buf`, so they're copied out before it's
+            // dropped.
             let items = std::slice::from_raw_parts(items_ptr, item_count as usize);
-            let sum: f64 = items
-                .iter()
-                .filter(|it| it.FmtValue.CStatus == 0)
-                .map(|it| it.FmtValue.Anonymous.doubleValue)
-                .sum();
-            Some(sum.min(100.0) as f32)
+            Some(
+                items
+                    .iter()
+                    .filter(|it| it.FmtValue.CStatus == 0)
+                    .map(|it| {
+                        (
+                            it.szName.to_string().unwrap_or_default(),
+                            it.FmtValue.Anonymous.doubleValue,
+                        )
+                    })
+                    .collect(),
+            )
         }
     }
 

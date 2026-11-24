@@ -2,7 +2,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::Action;
 use crate::data::{Db, SessionRow};
-use crate::format::{format_datetime, format_duration};
+use crate::format::{format_celsius, format_datetime, format_duration};
 
 /// How often the list checks whether the agent has written to the
 /// database. egui only repaints on input, so without a scheduled repaint the
@@ -81,6 +81,7 @@ impl SessionsView {
             .column(Column::auto().at_least(70.0)) // avg cpu
             .column(Column::auto().at_least(70.0)) // peak cpu
             .column(Column::auto().at_least(130.0)) // peak mem: "22848 MB (35%)"
+            .column(Column::auto().at_least(150.0)) // peak temp: "GPU 72 °C, Board 28 °C"
             .column(Column::auto().at_least(60.0)) // events
             // Actions. Wide enough up front for the widest state (Open,
             // Rename, Confirm delete, Cancel ≈ 295 pt): sized only for the
@@ -90,7 +91,15 @@ impl SessionsView {
             .column(Column::auto().at_least(300.0))
             .header(20.0, |mut header| {
                 for label in [
-                    "Started", "Duration", "Label", "Avg CPU", "Peak CPU", "Peak Mem", "Events", "",
+                    "Started",
+                    "Duration",
+                    "Label",
+                    "Avg CPU",
+                    "Peak CPU",
+                    "Peak Mem",
+                    "Peak Temp",
+                    "Events",
+                    "",
                 ] {
                     header.col(|ui| {
                         ui.strong(label);
@@ -155,6 +164,9 @@ impl SessionsView {
                             );
                         });
                         tr.col(|ui| {
+                            ui.label(format_peak_temps(&row.summary.peak_temps));
+                        });
+                        tr.col(|ui| {
                             let total: i64 = row.summary.event_counts.iter().map(|(_, c)| c).sum();
                             ui.label(total.to_string());
                         });
@@ -191,5 +203,33 @@ impl SessionsView {
             self.refresh(db);
         }
         action
+    }
+}
+
+/// `GPU 72 °C, Board 28 °C`, hottest kind first (the order the summary
+/// query returns), or `—` for a session without temperatures.
+fn format_peak_temps(peaks: &[(storage::SensorKind, f64)]) -> String {
+    if peaks.is_empty() {
+        return "—".into();
+    }
+    peaks
+        .iter()
+        .map(|(kind, c)| format!("{} {}", kind.label(), format_celsius(*c)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::SensorKind;
+
+    #[test]
+    fn peak_temps_list_each_kind_or_a_dash() {
+        assert_eq!(format_peak_temps(&[]), "—");
+        assert_eq!(
+            format_peak_temps(&[(SensorKind::Gpu, 71.6), (SensorKind::Board, 27.85)]),
+            "GPU 72 °C, Board 28 °C"
+        );
     }
 }

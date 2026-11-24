@@ -8,6 +8,7 @@ mod export;
 mod format;
 mod icon;
 mod process_agg;
+mod temps;
 mod views;
 
 fn main() -> eframe::Result {

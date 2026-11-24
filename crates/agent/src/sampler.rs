@@ -121,6 +121,8 @@ impl Sampler {
             page_faults_per_sec: sys_counters.page_faults_per_sec,
             gpu_pct: sys_counters.gpu_pct,
             disk_queue_len: sys_counters.disk_queue_len,
+            temps: sys_counters.temps,
+            cpu_perf: sys_counters.cpu_perf,
             top_processes: process_samples,
         }
     }

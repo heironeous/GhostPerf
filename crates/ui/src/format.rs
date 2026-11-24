@@ -78,6 +78,18 @@ pub fn format_pct(pct: f64) -> String {
     format!("{pct:.0}%")
 }
 
+/// A temperature as a chart label or table cell: `85 °C`. Whole degrees:
+/// sensors report tenths at best, and the grid's 10/20 °C steps label
+/// cleanly.
+pub fn format_celsius(c: f64) -> String {
+    format!("{c:.0} °C")
+}
+
+/// A CPU clock: `3.85 GHz`, the unit people quote CPU clocks in.
+pub fn format_mhz(mhz: f64) -> String {
+    format!("{:.2} GHz", mhz / 1000.0)
+}
+
 /// A disk queue length (a plain count, usually well under 10): `0`,
 /// `0.25`, `1.5`, `12`. Two decimals at most, trailing zeros dropped, so
 /// the grid's 0.1/0.2 steps label as `0.1`, `0.2` rather than `0.10`; whole
@@ -132,6 +144,8 @@ mod tests {
             format_queue(-0.125),
             format_queue(99.99),
             format_queue(12_345.0),
+            format_celsius(-40.0),
+            format_celsius(105.0),
         ] {
             assert!(label.chars().count() <= 10, "{label:?} is too long");
         }
@@ -149,6 +163,14 @@ mod tests {
         // Auto-bounds pad below 0; a value that rounds to zero isn't "-0".
         assert_eq!(format_queue(-0.001), "0");
         assert_eq!(format_queue(-0.5), "-0.5");
+    }
+
+    #[test]
+    fn temperatures_and_clocks_format_in_their_usual_units() {
+        assert_eq!(format_celsius(84.6), "85 °C");
+        assert_eq!(format_celsius(27.85), "28 °C");
+        assert_eq!(format_mhz(3850.1), "3.85 GHz");
+        assert_eq!(format_mhz(4397.6), "4.40 GHz");
     }
 
     #[test]

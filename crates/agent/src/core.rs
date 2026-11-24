@@ -8,6 +8,7 @@ use storage::{MetricSample, NewEvent, Store};
 use crate::eventlog;
 use crate::live::LiveSettings;
 use crate::now_millis;
+use crate::thermal_watch::ThermalWatch;
 use agent_config::AgentConfig;
 
 pub enum CoreMsg {
@@ -67,6 +68,7 @@ pub fn run(
     // `sample_interval_ms`, so a plain `recv_timeout(flush_interval)` would
     // never time out and only the size-based flush would ever fire.
     let mut last_flush = Instant::now();
+    let mut thermal_watch = ThermalWatch::default();
 
     loop {
         let wait = flush_interval.saturating_sub(last_flush.elapsed());
@@ -81,6 +83,7 @@ pub fn run(
                         .map_err(anyhow::Error::from)
                         .map(|id| {
                             current_session = Some((id, started_at));
+                            thermal_watch = ThermalWatch::default();
                             recording_flag.store(true, Ordering::SeqCst);
                             log::info!("session {id} started (label: {label:?})");
                             id
@@ -143,6 +146,7 @@ pub fn run(
             Ok(CoreMsg::Sample(sample)) => {
                 if current_session.is_some() {
                     check_thresholds(&sample, &config, &mut events_buffer);
+                    thermal_watch.check(&sample, &config, &mut events_buffer);
                     buffer.push(sample);
                     if buffer.len() >= config.flush_batch_size {
                         if let Some((id, _)) = current_session {
@@ -427,6 +431,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         }
     }

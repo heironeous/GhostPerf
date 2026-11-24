@@ -54,10 +54,11 @@ pub fn export_json(
     )
 }
 
-/// One row per sample. `cpu_per_core_pct` and `top_processes` don't fit a
-/// flat row, so they're serialized to JSON text in their own columns rather
-/// than dropped — CSV is for spreadsheets/plotting on the scalar columns,
-/// not meant to be the lossless format (that's `export_json`).
+/// One row per sample. `cpu_per_core_pct`, `temps` and `top_processes`
+/// don't fit a flat row (their length varies), so they're serialized to
+/// JSON text in their own columns rather than dropped — CSV is for
+/// spreadsheets/plotting on the scalar columns, not meant to be the lossless
+/// format (that's `export_json`).
 pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Result<()> {
     let mut w = csv::Writer::from_writer(writer);
     w.write_record([
@@ -74,9 +75,16 @@ pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Resul
         "page_faults_per_sec",
         "gpu_pct",
         "disk_queue_len",
+        "cpu_freq_mhz",
+        "cpu_perf_pct",
+        "cpu_perf_limit_pct",
+        "cpu_perf_limit_flags",
+        "temps",
         "top_processes",
     ])?;
+    let opt = |v: Option<String>| v.unwrap_or_default();
     for m in metrics {
+        let perf = m.cpu_perf;
         w.write_record([
             m.ts.to_string(),
             m.cpu_pct.to_string(),
@@ -91,6 +99,11 @@ pub fn export_csv(metrics: &[MetricSample], writer: impl Write) -> anyhow::Resul
             m.page_faults_per_sec.to_string(),
             m.gpu_pct.map_or_else(String::new, |v| v.to_string()),
             m.disk_queue_len.map_or_else(String::new, |v| v.to_string()),
+            opt(perf.map(|p| p.freq_mhz.to_string())),
+            opt(perf.map(|p| p.perf_pct.to_string())),
+            opt(perf.map(|p| p.limit_pct.to_string())),
+            opt(perf.map(|p| p.limit_flags.to_string())),
+            serde_json::to_string(&m.temps)?,
             serde_json::to_string(&m.top_processes)?,
         ])?;
     }
@@ -143,6 +156,8 @@ mod tests {
             page_faults_per_sec: 10.0,
             gpu_pct: Some(33.0),
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: vec![ProcessSample {
                 pid: 1,
                 name: "a.exe".into(),
@@ -163,6 +178,37 @@ mod tests {
         assert_eq!(lines.len(), 3, "{text}");
         assert!(lines[0].starts_with("ts,cpu_pct,"));
         assert!(lines[1].contains("1000,12.5,"));
+    }
+
+    #[test]
+    fn csv_has_cpu_perf_columns_and_temps_as_json() {
+        let mut m = sample();
+        m.cpu_perf = Some(storage::CpuPerf {
+            freq_mhz: 3850.5,
+            perf_pct: 107.0,
+            limit_pct: 100.0,
+            limit_flags: 0,
+        });
+        m.temps = vec![storage::TempReading {
+            sensor: "GPU".into(),
+            kind: storage::SensorKind::Gpu,
+            celsius: 61.5,
+        }];
+        let mut buf = Vec::new();
+        export_csv(&[m, sample()], &mut buf).unwrap();
+        let mut rows = csv::Reader::from_reader(buf.as_slice());
+        let headers = rows.headers().unwrap().clone();
+        let col = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        let records: Vec<_> = rows.records().map(|r| r.unwrap()).collect();
+        assert_eq!(&records[0][col("cpu_freq_mhz")], "3850.5");
+        assert_eq!(&records[0][col("cpu_perf_limit_flags")], "0");
+        assert_eq!(
+            &records[0][col("temps")],
+            r#"[{"sensor":"GPU","kind":"gpu","celsius":61.5}]"#
+        );
+        // A sample without them: empty fields and an empty list.
+        assert_eq!(&records[1][col("cpu_perf_pct")], "");
+        assert_eq!(&records[1][col("temps")], "[]");
     }
 
     #[test]

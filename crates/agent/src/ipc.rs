@@ -137,16 +137,23 @@ fn dispatch(line: &str, core_tx: &Sender<CoreMsg>, telemetry: &Telemetry) -> Str
         // nothing is recording, so a response with no data yet (the
         // sampler hasn't ticked since this lease started) is expected on
         // the very first poll or two, not an error.
+        // The temperature fields (Phase 8) came later; an older overlay
+        // skips keys it doesn't know, so adding fields doesn't break it.
         "live" => match telemetry.poll(now_millis()) {
-            Some(s) => format!(
-                "OK cpu_pct={:.1} mem_used_pct={} gpu_pct={} age_ms={}",
-                s.cpu_pct,
-                s.mem_used_pct
-                    .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-                s.gpu_pct
-                    .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-                (now_millis() - s.ts).max(0)
-            ),
+            Some(s) => {
+                let opt = |v: Option<f32>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+                format!(
+                    "OK cpu_pct={:.1} mem_used_pct={} gpu_pct={} cpu_temp_c={} gpu_temp_c={} \
+                     board_temp_c={} age_ms={}",
+                    s.cpu_pct,
+                    opt(s.mem_used_pct),
+                    opt(s.gpu_pct),
+                    opt(s.cpu_temp_c),
+                    opt(s.gpu_temp_c),
+                    opt(s.board_temp_c),
+                    (now_millis() - s.ts).max(0)
+                )
+            }
             None => "OK no_data_yet".to_string(),
         },
         "shutdown" => {
@@ -177,6 +184,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: Some(5.0),
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         }
     }
@@ -196,6 +205,30 @@ mod tests {
         let reply = dispatch("live", &core_tx, &telemetry);
         assert!(
             reply.starts_with("OK cpu_pct=42.0 mem_used_pct=") && reply.contains("gpu_pct=5.0"),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn live_reports_the_hottest_sensor_of_each_kind() {
+        use storage::{SensorKind, TempReading};
+        let (core_tx, _core_rx) = channel();
+        let telemetry = Telemetry::new();
+        let mut s = sample(now_millis(), 10.0);
+        let t = |sensor: &str, kind, celsius| TempReading {
+            sensor: sensor.into(),
+            kind,
+            celsius,
+        };
+        s.temps = vec![
+            t("GPU 0", SensorKind::Gpu, 55.0),
+            t("GPU 1", SensorKind::Gpu, 71.5),
+            t(r"ACPI \_TZ.TZ00", SensorKind::Board, 27.85),
+        ];
+        telemetry.publish(&s);
+        let reply = dispatch("live", &core_tx, &telemetry);
+        assert!(
+            reply.contains(" cpu_temp_c=- gpu_temp_c=71.5 board_temp_c=27.9 age_ms="),
             "{reply}"
         );
     }

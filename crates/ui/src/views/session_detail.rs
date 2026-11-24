@@ -5,9 +5,11 @@ use crate::app::Action;
 use crate::data::Db;
 use crate::export;
 use crate::format::{
-    format_datetime, format_duration, format_mb, format_pct, format_queue, format_rate,
+    format_celsius, format_datetime, format_duration, format_mb, format_mhz, format_pct,
+    format_queue, format_rate,
 };
 use crate::process_agg::aggregate_processes;
+use crate::temps;
 
 /// One y-axis width (ui points) for every chart *and* the overview strip.
 /// `egui_plot` otherwise sizes each plot's y-axis to its own tick labels
@@ -23,12 +25,23 @@ const OVERVIEW_HEIGHT: f32 = 60.0;
 /// Width of the title column left of every plot. Fixed, and the same for
 /// all of them including the overview strip, for the same reason as
 /// `Y_AXIS_WIDTH`: the plots must start at the same x. Wide enough for the
-/// longest title ("Disk queue") on one line.
-const TITLE_WIDTH: f32 = 84.0;
+/// longest title ("Temperature") on one line.
+const TITLE_WIDTH: f32 = 96.0;
+/// Height of the one-line row shown in place of a chart with no data.
+const UNAVAILABLE_HEIGHT: f32 = 24.0;
 
 const DISK_QUEUE_HINT: &str = "Average number of disk requests waiting or in service, \
     all physical disks. Sustained values above about 2 per disk mean I/O is backing up, \
     even when the byte rates above look low.";
+const CPU_PERF_HINT: &str = "Performance: the CPU's speed relative to its base clock \
+    (over 100% is turbo; the clock is on hover). Limit: the most the CPU is currently \
+    allowed, 100% when nothing holds it back. A limit dropping under load is the CPU \
+    throttling for heat or power (marked as cpu_throttle). Windows doesn't say which.";
+const TEMP_HINT: &str = "Every temperature sensor Windows exposes without admin rights: \
+    GPUs (as Task Manager reads them) and ACPI thermal zones (a motherboard or chassis \
+    sensor, never the CPU die). The CPU's own temperature isn't readable this way.";
+
+const PERF_SERIES: &str = "Performance";
 
 /// Lays out one plot with its title in a column to its left, vertically
 /// centered, with `hint` on hover. The title used to be only the legend's
@@ -140,6 +153,42 @@ fn mem_hover_label(
     hover_label(pos, format_pct, event_kinds)
 }
 
+/// The CPU performance chart's hover adds the clock behind the percentage:
+/// `Performance: 107% (3.85 GHz)`. `freq_mhz[i]` belongs to the `i`th
+/// plotted point, as in [`mem_hover_label`].
+fn perf_hover_label(
+    pos: &HoverPosition<'_>,
+    freq_mhz: &[f32],
+    event_kinds: &[String],
+) -> Option<String> {
+    if let HoverPosition::NearDataPoint {
+        plot_name,
+        position,
+        index,
+    } = pos
+    {
+        if *plot_name == PERF_SERIES {
+            if let Some(&mhz) = freq_mhz.get(*index) {
+                return Some(format!(
+                    "{PERF_SERIES}: {} ({})\n{:.1} s",
+                    format_pct(position.y),
+                    format_mhz(mhz as f64),
+                    position.x
+                ));
+            }
+        }
+    }
+    hover_label(pos, format_pct, event_kinds)
+}
+
+/// A one-line row in place of a chart that has nothing to show, so a
+/// missing sensor reads as "not available" rather than as a recording fault.
+fn unavailable(ui: &mut egui::Ui, title: &str, hint: &str, message: &str) {
+    titled(ui, title, hint, UNAVAILABLE_HEIGHT, |ui| {
+        ui.weak(message);
+    });
+}
+
 /// Color per event `kind`, shared between the chart markers and the legend
 /// so a stall always looks like a stall across the view.
 fn event_color(kind: &str) -> egui::Color32 {
@@ -147,6 +196,8 @@ fn event_color(kind: &str) -> egui::Color32 {
         "stall" => egui::Color32::from_rgb(255, 165, 0),
         "cpu_spike" => egui::Color32::RED,
         "mem_spike" => egui::Color32::from_rgb(200, 0, 200),
+        "temp_spike" => egui::Color32::from_rgb(255, 90, 60),
+        "cpu_throttle" => egui::Color32::from_rgb(0, 190, 190),
         k if k.starts_with("eventlog_") => egui::Color32::GRAY,
         _ => egui::Color32::LIGHT_BLUE,
     }
@@ -342,6 +393,23 @@ impl DetailView {
             .iter()
             .filter_map(|m| Some([seconds_of(m.ts), m.disk_queue_len? as f64]))
             .collect();
+        // Phase 8. The clocks are collected from the same filtered sequence
+        // as the performance points, so hover indices line up (as for memory).
+        let (perf_points, perf_freq_mhz): (Vec<[f64; 2]>, Vec<f32>) = self
+            .metrics
+            .iter()
+            .filter_map(|m| {
+                let p = m.cpu_perf?;
+                Some(([seconds_of(m.ts), p.perf_pct as f64], p.freq_mhz))
+            })
+            .unzip();
+        let limit_points: Vec<[f64; 2]> = self
+            .metrics
+            .iter()
+            .filter_map(|m| Some([seconds_of(m.ts), m.cpu_perf?.limit_pct as f64]))
+            .collect();
+        let temp_series = temps::series(&self.metrics, seconds_of);
+        let constant_sensors = temps::constant_sensors(&self.metrics);
 
         let add_events = |plot_ui: &mut egui_plot::PlotUi| {
             for e in events {
@@ -379,6 +447,26 @@ impl DetailView {
                 add_events(plot_ui);
             });
         });
+        if perf_points.is_empty() {
+            unavailable(
+                ui,
+                "CPU speed",
+                CPU_PERF_HINT,
+                "Not available: Windows' processor performance counters couldn't be read, \
+                 or this session was recorded before GhostPerf recorded them.",
+            );
+        } else {
+            let perf_kinds = event_kinds.clone();
+            titled(ui, "CPU speed", CPU_PERF_HINT, PLOT_HEIGHT, |ui| {
+                chart("cpu_perf", format_pct)
+                    .label_formatter(move |pos| perf_hover_label(pos, &perf_freq_mhz, &perf_kinds))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new(PERF_SERIES, PlotPoints::from(perf_points)));
+                        plot_ui.line(Line::new("Limit", PlotPoints::from(limit_points)));
+                        add_events(plot_ui);
+                    });
+            });
+        }
         let mem_kinds = event_kinds.clone();
         titled(
             ui,
@@ -432,6 +520,35 @@ impl DetailView {
                 });
             },
         );
+        if temp_series.is_empty() {
+            unavailable(
+                ui,
+                "Temperature",
+                TEMP_HINT,
+                "Not available: no temperature sensor was readable while this session \
+                 recorded, or it was recorded before GhostPerf recorded temperatures.",
+            );
+        } else {
+            titled(ui, "Temperature", TEMP_HINT, PLOT_HEIGHT, |ui| {
+                chart("temp", format_celsius).show(ui, |plot_ui| {
+                    for (sensor, _, points) in temp_series {
+                        plot_ui.line(Line::new(sensor, PlotPoints::from(points)));
+                    }
+                    add_events(plot_ui);
+                });
+            });
+            // Under the chart, lined up with the plot area rather than the
+            // title or the axis labels.
+            for (sensor, value) in &constant_sensors {
+                ui.horizontal(|ui| {
+                    ui.add_space(TITLE_WIDTH + ui.spacing().item_spacing.x + Y_AXIS_WIDTH);
+                    ui.weak(format!(
+                        "{sensor} read {value:.2} °C for the whole session: probably a fixed \
+                         value from the firmware, not a real sensor."
+                    ));
+                });
+            }
+        }
 
         // Overview/selector strip: drag is reserved entirely for brush
         // selection (see `drag_start`/`selection`), so pan/zoom/box-zoom are
@@ -717,6 +834,30 @@ mod tests {
         assert_eq!(
             mem_hover_label(&pos, &mem_mb, &kinds).as_deref(),
             Some("mem_spike\n3.0 s")
+        );
+    }
+
+    #[test]
+    fn cpu_performance_hover_shows_the_clock() {
+        let freqs = [3600.0, 3850.1];
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: PERF_SERIES,
+            position: egui_plot::PlotPoint::new(12.0, 106.9),
+            index: 1,
+        };
+        assert_eq!(
+            perf_hover_label(&pos, &freqs, &[]).as_deref(),
+            Some("Performance: 107% (3.85 GHz)\n12.0 s")
+        );
+        // The limit line is a plain percentage.
+        let pos = HoverPosition::NearDataPoint {
+            plot_name: "Limit",
+            position: egui_plot::PlotPoint::new(12.0, 100.0),
+            index: 1,
+        };
+        assert_eq!(
+            perf_hover_label(&pos, &freqs, &[]).as_deref(),
+            Some("Limit: 100%\n12.0 s")
         );
     }
 

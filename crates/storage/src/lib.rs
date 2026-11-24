@@ -35,6 +35,98 @@ pub struct SessionSummary {
     pub peak_mem_used_pct: Option<f64>,
     /// `(kind, count)`, one row per distinct `events.kind` for the session.
     pub event_counts: Vec<(String, i64)>,
+    /// Hottest reading of each [`SensorKind`] over the session, in °C,
+    /// hottest kind first. Empty for a session with no temperature readings
+    /// (no readable sensor, or recorded before temperatures existed).
+    pub peak_temps: Vec<(SensorKind, f64)>,
+}
+
+/// What a temperature sensor measures, for grouping (the overlay's one
+/// number per kind, the session list's peaks) and per-kind thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SensorKind {
+    /// No Windows source yet (it needs a kernel driver; see TODO.md). The
+    /// Linux dev build reports `x86_pkg_temp`-style zones as this.
+    Cpu,
+    Gpu,
+    /// An ACPI thermal zone. Usually a motherboard or chassis sensor, never
+    /// the CPU die, and on many desktops a fixed placeholder value from the
+    /// firmware rather than a real sensor (see `TempReading`).
+    Board,
+    /// A kind written by a newer version, so this one can still load the
+    /// rest of the sample instead of failing on it.
+    #[serde(other)]
+    Other,
+}
+
+impl SensorKind {
+    /// The lowercase name used in JSON and in the agent's `live` reply.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SensorKind::Cpu => "cpu",
+            SensorKind::Gpu => "gpu",
+            SensorKind::Board => "board",
+            SensorKind::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "cpu" => SensorKind::Cpu,
+            "gpu" => SensorKind::Gpu,
+            "board" => SensorKind::Board,
+            _ => SensorKind::Other,
+        }
+    }
+
+    /// For people: chart legends, the session list, the overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            SensorKind::Cpu => "CPU",
+            SensorKind::Gpu => "GPU",
+            SensorKind::Board => "Board",
+            SensorKind::Other => "Other",
+        }
+    }
+}
+
+/// One temperature sensor's reading in one sample.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TempReading {
+    /// Stable across samples (it names the chart line): the GPU's adapter
+    /// name, or the ACPI zone's name. Two identical GPUs get distinct names.
+    pub sensor: String,
+    pub kind: SensorKind,
+    pub celsius: f32,
+}
+
+/// CPU frequency and performance limiting, from the Windows `Processor
+/// Information(_Total)` counters. Temperature itself isn't readable on
+/// Windows without a kernel driver, but the CPU slowing itself down is: a
+/// heat or power problem shows up here as `limit_pct` dropping below 100.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CpuPerf {
+    /// Effective clock (`Actual Frequency`), base clock × `perf_pct` / 100.
+    pub freq_mhz: f32,
+    /// Performance relative to the base clock (`% Processor Performance`).
+    /// Over 100 means turbo.
+    pub perf_pct: f32,
+    /// The highest performance currently allowed, as a percentage
+    /// (`% Performance Limit`): 100 means not limited.
+    pub limit_pct: f32,
+    /// `Performance Limit Flags`, stored as is. Non-zero means some limit is
+    /// active. Microsoft doesn't document which bit means what (thermal,
+    /// power, current, …), so nothing here tells them apart.
+    pub limit_flags: u32,
+}
+
+impl CpuPerf {
+    /// Whether anything is holding the CPU below its full performance. 99.5,
+    /// not 100: the counter is a formatted double.
+    pub fn is_limited(&self) -> bool {
+        self.limit_pct < 99.5 || self.limit_flags != 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +171,13 @@ pub struct MetricSample {
     /// few bytes.
     #[serde(default)]
     pub disk_queue_len: Option<f32>,
+    /// Every readable temperature sensor. Empty when none is readable, and
+    /// for samples recorded before temperatures were added.
+    #[serde(default)]
+    pub temps: Vec<TempReading>,
+    /// `None` where the counters aren't available, and for older samples.
+    #[serde(default)]
+    pub cpu_perf: Option<CpuPerf>,
     pub top_processes: Vec<ProcessSample>,
 }
 
@@ -99,6 +198,16 @@ impl MetricSample {
     pub fn mem_used_pct(&self) -> Option<f32> {
         let total = self.mem_total_mb();
         (total > 0.0).then(|| self.mem_used_mb / total * 100.0)
+    }
+
+    /// The hottest sensor of `kind` in this sample: what the overlay shows
+    /// for "GPU" when there are several GPUs.
+    pub fn hottest(&self, kind: SensorKind) -> Option<f32> {
+        self.temps
+            .iter()
+            .filter(|t| t.kind == kind)
+            .map(|t| t.celsius)
+            .reduce(f32::max)
     }
 }
 
@@ -194,6 +303,14 @@ impl Store {
         self.ensure_column("metrics", "page_faults_per_sec", "REAL NOT NULL DEFAULT 0")?;
         self.ensure_column("metrics", "gpu_pct", "REAL")?;
         self.ensure_column("metrics", "disk_queue_len", "REAL")?;
+        // Phase 8. A JSON array like `cpu_per_core_json`, since the number of
+        // sensors varies by machine (several GPUs, several ACPI zones).
+        // NULL, not `[]`, for older rows; both read back as no readings.
+        self.ensure_column("metrics", "temps_json", "TEXT")?;
+        self.ensure_column("metrics", "cpu_freq_mhz", "REAL")?;
+        self.ensure_column("metrics", "cpu_perf_pct", "REAL")?;
+        self.ensure_column("metrics", "cpu_perf_limit_pct", "REAL")?;
+        self.ensure_column("metrics", "cpu_perf_limit_flags", "INTEGER")?;
 
         Ok(())
     }
@@ -277,12 +394,16 @@ impl Store {
                     session_id, ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb,
                     disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps,
                     context_switches_per_sec, page_faults_per_sec, gpu_pct, disk_queue_len,
-                    top_processes_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    top_processes_json, temps_json, cpu_freq_mhz, cpu_perf_pct,
+                    cpu_perf_limit_pct, cpu_perf_limit_flags
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                           ?16, ?17, ?18, ?19, ?20)",
             )?;
             for s in samples {
                 let cpu_per_core_json = serde_json::to_string(&s.cpu_per_core_pct)?;
                 let top_json = serde_json::to_string(&s.top_processes)?;
+                let temps_json = serde_json::to_string(&s.temps)?;
+                let perf = s.cpu_perf;
                 stmt.execute(params![
                     session_id,
                     s.ts,
@@ -299,6 +420,11 @@ impl Store {
                     s.gpu_pct,
                     s.disk_queue_len,
                     top_json,
+                    temps_json,
+                    perf.map(|p| p.freq_mhz),
+                    perf.map(|p| p.perf_pct),
+                    perf.map(|p| p.limit_pct),
+                    perf.map(|p| p.limit_flags),
                 ])?;
             }
         }
@@ -378,12 +504,27 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT ts, cpu_pct, cpu_per_core_json, mem_used_mb, mem_available_mb, disk_read_bps,
                     disk_write_bps, net_rx_bps, net_tx_bps, context_switches_per_sec,
-                    page_faults_per_sec, gpu_pct, disk_queue_len, top_processes_json
+                    page_faults_per_sec, gpu_pct, disk_queue_len, top_processes_json,
+                    temps_json, cpu_freq_mhz, cpu_perf_pct, cpu_perf_limit_pct,
+                    cpu_perf_limit_flags
              FROM metrics WHERE session_id = ?1 ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             let cpu_per_core_json: String = row.get(2)?;
             let top_json: String = row.get(13)?;
+            let temps_json: Option<String> = row.get(14)?;
+            // All four come from one PDH counter set, written together.
+            let cpu_perf = match (row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?) {
+                (Some(freq_mhz), Some(perf_pct), Some(limit_pct), Some(limit_flags)) => {
+                    Some(CpuPerf {
+                        freq_mhz,
+                        perf_pct,
+                        limit_pct,
+                        limit_flags,
+                    })
+                }
+                _ => None,
+            };
             Ok((
                 MetricSample {
                     ts: row.get(0)?,
@@ -399,18 +540,24 @@ impl Store {
                     page_faults_per_sec: row.get(10)?,
                     gpu_pct: row.get(11)?,
                     disk_queue_len: row.get(12)?,
+                    temps: Vec::new(),
+                    cpu_perf,
                     top_processes: Vec::new(),
                 },
                 cpu_per_core_json,
                 top_json,
+                temps_json,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (mut sample, cpu_per_core_json, top_json) = row?;
+            let (mut sample, cpu_per_core_json, top_json, temps_json) = row?;
             sample.cpu_per_core_pct = serde_json::from_str(&cpu_per_core_json)?;
             sample.top_processes = serde_json::from_str(&top_json)?;
+            if let Some(temps_json) = temps_json {
+                sample.temps = serde_json::from_str(&temps_json)?;
+            }
             out.push(sample);
         }
         Ok(out)
@@ -455,6 +602,24 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        // In SQL, like the rest of the summary, so the list doesn't load
+        // every sample: `json_each` expands each row's array of readings.
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(t.value, '$.kind') AS kind, \
+                    MAX(json_extract(t.value, '$.celsius')) AS peak \
+             FROM metrics, json_each(metrics.temps_json) AS t \
+             WHERE metrics.session_id = ?1 AND metrics.temps_json IS NOT NULL \
+             GROUP BY kind ORDER BY peak DESC",
+        )?;
+        let peak_temps = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    SensorKind::parse(&row.get::<_, String>(0)?),
+                    row.get::<_, f64>(1)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         Ok(SessionSummary {
             sample_count,
             avg_cpu_pct,
@@ -462,6 +627,7 @@ impl Store {
             peak_mem_used_mb,
             peak_mem_used_pct,
             event_counts,
+            peak_temps,
         })
     }
 
@@ -597,6 +763,8 @@ mod tests {
             page_faults_per_sec: 75.0,
             gpu_pct: Some(33.0),
             disk_queue_len: Some(1.5),
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: vec![ProcessSample {
                 pid: 42,
                 name: "example.exe".into(),
@@ -717,6 +885,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         };
         store
@@ -794,6 +964,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         };
         assert_eq!(s.mem_total_mb(), 64_000.0);
@@ -807,6 +979,101 @@ mod tests {
         let id = store.start_session(0, None, None).unwrap();
         store.insert_metrics_batch(id, &[s]).unwrap();
         assert_eq!(store.session_summary(id).unwrap().peak_mem_used_pct, None);
+    }
+
+    fn temp(sensor: &str, kind: SensorKind, celsius: f32) -> TempReading {
+        TempReading {
+            sensor: sensor.into(),
+            kind,
+            celsius,
+        }
+    }
+
+    #[test]
+    fn temps_and_cpu_perf_roundtrip() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(0, None, None).unwrap();
+        let mut s = minimal_sample(1);
+        s.temps = vec![
+            temp("NVIDIA GeForce RTX 3060 Ti", SensorKind::Gpu, 61.5),
+            temp(r"ACPI \_TZ.TZ00", SensorKind::Board, 27.85),
+        ];
+        s.cpu_perf = Some(CpuPerf {
+            freq_mhz: 4397.6,
+            perf_pct: 122.2,
+            limit_pct: 87.0,
+            limit_flags: 2,
+        });
+        store.insert_metrics_batch(id, &[s.clone()]).unwrap();
+
+        let back = &store.metrics_for_session(id).unwrap()[0];
+        assert_eq!(back.temps, s.temps);
+        assert_eq!(back.cpu_perf, s.cpu_perf);
+        assert!(back.cpu_perf.unwrap().is_limited());
+        assert_eq!(back.hottest(SensorKind::Gpu), Some(61.5));
+        assert_eq!(back.hottest(SensorKind::Cpu), None);
+    }
+
+    #[test]
+    fn cpu_perf_is_limited_only_below_full_or_with_flags() {
+        let perf = |limit_pct, limit_flags| CpuPerf {
+            freq_mhz: 3600.0,
+            perf_pct: 100.0,
+            limit_pct,
+            limit_flags,
+        };
+        assert!(!perf(100.0, 0).is_limited());
+        assert!(!perf(99.8, 0).is_limited(), "formatting noise, not a limit");
+        assert!(perf(95.0, 0).is_limited());
+        assert!(perf(100.0, 1).is_limited());
+    }
+
+    #[test]
+    fn session_summary_has_the_peak_of_each_sensor_kind() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store.start_session(0, None, None).unwrap();
+        let with = |ts, gpu0: f32, gpu1: f32, board: f32| {
+            let mut s = minimal_sample(ts);
+            s.temps = vec![
+                temp("GPU 0", SensorKind::Gpu, gpu0),
+                temp("GPU 1", SensorKind::Gpu, gpu1),
+                temp("TZ00", SensorKind::Board, board),
+            ];
+            s
+        };
+        // A sample from before temperatures existed (NULL column) in between.
+        store
+            .insert_metrics_batch(
+                id,
+                &[
+                    with(1, 40.0, 70.5, 30.0),
+                    minimal_sample(2),
+                    with(3, 82.0, 50.0, 31.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.session_summary(id).unwrap().peak_temps,
+            vec![(SensorKind::Gpu, 82.0), (SensorKind::Board, 31.0)]
+        );
+
+        let empty = store.start_session(10, None, None).unwrap();
+        store
+            .insert_metrics_batch(empty, &[minimal_sample(11)])
+            .unwrap();
+        assert!(store.session_summary(empty).unwrap().peak_temps.is_empty());
+    }
+
+    #[test]
+    fn a_sensor_kind_from_a_newer_version_still_loads() {
+        let t: TempReading =
+            serde_json::from_str(r#"{"sensor":"x","kind":"nvme","celsius":40.0}"#).unwrap();
+        assert_eq!(t.kind, SensorKind::Other);
+        assert_eq!(SensorKind::parse("gpu"), SensorKind::Gpu);
+        assert_eq!(
+            SensorKind::parse(SensorKind::Board.as_str()),
+            SensorKind::Board
+        );
     }
 
     fn minimal_sample(ts: i64) -> MetricSample {
@@ -824,6 +1091,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         }
     }
@@ -1107,6 +1376,8 @@ mod tests {
             page_faults_per_sec: 3.0,
             gpu_pct: None,
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         };
         store.insert_metrics_batch(id, &[sample]).unwrap();

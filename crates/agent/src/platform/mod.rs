@@ -8,6 +8,9 @@
 mod generic_impl;
 #[cfg(target_os = "linux")]
 mod linux_impl;
+mod thermal;
+#[cfg(target_os = "windows")]
+mod windows_gpu;
 #[cfg(target_os = "windows")]
 mod windows_impl;
 
@@ -28,4 +31,8 @@ pub struct SystemCounters {
     /// Average disk queue length over the interval (see
     /// `storage::MetricSample::disk_queue_len`); `None` when unavailable.
     pub disk_queue_len: Option<f32>,
+    /// Every temperature sensor readable this tick (Phase 8).
+    pub temps: Vec<storage::TempReading>,
+    /// CPU frequency and performance limiting; `None` when unavailable.
+    pub cpu_perf: Option<storage::CpuPerf>,
 }

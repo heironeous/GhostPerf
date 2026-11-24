@@ -10,10 +10,11 @@ use crate::live_reply::{self, LiveReading};
 use crate::native_window::NativeWindow;
 
 /// Fixed logical size (DPI-independent egui points — see `OverlayConfig`'s
-/// doc on `margin_px`) for the small CPU/RAM/GPU readout. Not resizable:
-/// there's nothing to resize it with (no decorations, no mouse — see
-/// [`viewport`]), and a fixed size keeps corner placement simple.
-pub const WINDOW_SIZE: (f32, f32) = (170.0, 78.0);
+/// doc on `margin_px`) for the small readout: four rows (`LiveReading::rows`),
+/// the widest being `GPU  100.0%  100 °C`. Not resizable: there's nothing
+/// to resize it with (no decorations, no mouse — see [`viewport`]), and a
+/// fixed size keeps corner placement simple.
+pub const WINDOW_SIZE: (f32, f32) = (170.0, 96.0);
 
 /// The window TODO.md Phase 6 asks for: click-through (so it never steals
 /// input from the game), borderless, always-on-top, no taskbar entry.
@@ -314,21 +315,9 @@ impl eframe::App for OverlayApp {
                         ui.colored_label(text, "GhostPerf — waiting for data…");
                     }
                     Reading::Live(r) => {
-                        ui.colored_label(text, format!("CPU  {:>5.1}%", r.cpu_pct));
-                        ui.colored_label(
-                            text,
-                            r.mem_used_pct.map_or_else(
-                                || "RAM    —".to_string(),
-                                |v| format!("RAM  {v:>5.1}%"),
-                            ),
-                        );
-                        ui.colored_label(
-                            text,
-                            r.gpu_pct.map_or_else(
-                                || "GPU    —".to_string(),
-                                |v| format!("GPU  {v:>5.1}%"),
-                            ),
-                        );
+                        for row in r.rows() {
+                            ui.colored_label(text, row);
+                        }
                     }
                 }
             });

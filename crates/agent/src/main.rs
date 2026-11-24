@@ -13,6 +13,7 @@ mod sampler;
 mod sampling_loop;
 mod stall;
 mod telemetry;
+mod thermal_watch;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;

@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
-use storage::MetricSample;
+use storage::{MetricSample, SensorKind};
 
 /// How long after the last `live` poll to keep sampling before falling back
 /// to idle. Generous relative to any sane overlay refresh rate (hundreds of
@@ -32,6 +32,10 @@ pub struct LiveSnapshot {
     pub cpu_pct: f32,
     pub mem_used_pct: Option<f32>,
     pub gpu_pct: Option<f32>,
+    /// Hottest sensor of each kind (Phase 8), `None` where there's none.
+    pub cpu_temp_c: Option<f32>,
+    pub gpu_temp_c: Option<f32>,
+    pub board_temp_c: Option<f32>,
 }
 
 impl LiveSnapshot {
@@ -41,6 +45,9 @@ impl LiveSnapshot {
             cpu_pct: sample.cpu_pct,
             mem_used_pct: sample.mem_used_pct(),
             gpu_pct: sample.gpu_pct,
+            cpu_temp_c: sample.hottest(SensorKind::Cpu),
+            gpu_temp_c: sample.hottest(SensorKind::Gpu),
+            board_temp_c: sample.hottest(SensorKind::Board),
         }
     }
 }
@@ -119,6 +126,8 @@ mod tests {
             page_faults_per_sec: 0.0,
             gpu_pct: Some(10.0),
             disk_queue_len: None,
+            temps: Vec::new(),
+            cpu_perf: None,
             top_processes: Vec::new(),
         }
     }

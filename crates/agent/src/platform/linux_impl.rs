@@ -57,6 +57,9 @@ impl PlatformCounters {
             // No simple cross-vendor GPU utilization counter on Linux.
             gpu_pct: None,
             disk_queue_len,
+            temps: read_thermal_zones(std::path::Path::new("/sys/class/thermal")),
+            // No equivalent of the Windows performance-limit counters.
+            cpu_perf: None,
         }
     }
 
@@ -75,6 +78,54 @@ impl PlatformCounters {
             .find_map(|line| line.strip_prefix("Threads:"))
             .and_then(|v| v.trim().parse().ok())
     }
+}
+
+/// `thermal_zone*/{type,temp}` under `root` (normally `/sys/class/thermal`):
+/// the Linux stand-in for Windows' ACPI zones. Unlike Windows, Linux exposes
+/// the CPU package here (`x86_pkg_temp`), so those zones are `Cpu`.
+fn read_thermal_zones(root: &std::path::Path) -> Vec<storage::TempReading> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut zones: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("thermal_zone"))
+        .map(|e| e.path())
+        .collect();
+    zones.sort();
+    let readings: Vec<(String, storage::SensorKind, f32)> = zones
+        .iter()
+        .filter_map(|zone| {
+            let zone_type = fs::read_to_string(zone.join("type")).ok()?;
+            let millideg = fs::read_to_string(zone.join("temp")).ok()?;
+            let (kind, celsius) = parse_zone(zone_type.trim(), millideg.trim())?;
+            Some((zone_type.trim().to_string(), kind, celsius))
+        })
+        .collect();
+    let names = super::thermal::unique_names(readings.iter().map(|r| r.0.clone()).collect());
+    readings
+        .into_iter()
+        .zip(names)
+        .map(|((_, kind, celsius), sensor)| storage::TempReading {
+            sensor,
+            kind,
+            celsius,
+        })
+        .collect()
+}
+
+/// One zone's `type` and `temp` (millidegrees Celsius).
+fn parse_zone(zone_type: &str, millideg: &str) -> Option<(storage::SensorKind, f32)> {
+    let celsius = super::thermal::plausible(millideg.parse::<i64>().ok()? as f32 / 1000.0)?;
+    let kind = if ["pkg", "cpu", "coretemp", "k10temp"]
+        .iter()
+        .any(|k| zone_type.contains(k))
+    {
+        storage::SensorKind::Cpu
+    } else {
+        storage::SensorKind::Board
+    };
+    Some((kind, celsius))
 }
 
 fn read_proc_stat_ctxt() -> Option<u64> {
@@ -179,6 +230,50 @@ garbage line
         let whole = |name: &str| matches!(name, "sda" | "nvme0n1");
         assert_eq!(diskstats_weighted_ms(text, whole), Some(900 + 75));
         assert_eq!(diskstats_weighted_ms(text, |_| false), None);
+    }
+
+    #[test]
+    fn thermal_zones_parse_by_type() {
+        use storage::SensorKind;
+        assert_eq!(
+            parse_zone("x86_pkg_temp", "54000"),
+            Some((SensorKind::Cpu, 54.0))
+        );
+        assert_eq!(
+            parse_zone("acpitz", "27800"),
+            Some((SensorKind::Board, 27.8))
+        );
+        assert_eq!(parse_zone("acpitz", "-273150"), None, "an unset zone");
+        assert_eq!(parse_zone("acpitz", "garbage"), None);
+    }
+
+    #[test]
+    fn thermal_zones_read_from_a_sysfs_tree() {
+        let root = std::env::temp_dir().join(format!("ghostperf-thermal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (zone, zone_type, temp) in [
+            ("thermal_zone0", "acpitz", "30000"),
+            ("thermal_zone1", "x86_pkg_temp", "61000"),
+            ("thermal_zone2", "acpitz", "31000"),
+        ] {
+            fs::create_dir_all(root.join(zone)).unwrap();
+            fs::write(root.join(zone).join("type"), format!("{zone_type}\n")).unwrap();
+            fs::write(root.join(zone).join("temp"), format!("{temp}\n")).unwrap();
+        }
+        fs::create_dir_all(root.join("cooling_device0")).unwrap();
+        let names: Vec<_> = read_thermal_zones(&root)
+            .into_iter()
+            .map(|t| (t.sensor, t.celsius))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("acpitz".to_string(), 30.0),
+                ("x86_pkg_temp".to_string(), 61.0),
+                ("acpitz #2".to_string(), 31.0)
+            ]
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
