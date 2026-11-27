@@ -2,6 +2,8 @@
 
 A lightweight Windows performance monitor built to catch *intermittent* problems — stalls, spikes, leaks — that only show up occasionally and are gone by the time you go looking for them. A background agent records CPU/mem/disk/net/GPU, temperatures and CPU throttling, per-process stats, stall and threshold events, and correlated Event Log entries into a local SQLite file; a tray icon controls it; a session viewer lets you scrub back through a recording afterwards; an optional in-game overlay shows live CPU/RAM/GPU use and temperatures while you play.
 
+![GhostPerf session viewer: CPU, CPU speed, memory, disk I/O and disk queue charts for a recorded session, with stall and spike markers overlaid](docs/screenshot-session-detail.png)
+
 The shipping target is Windows. It's developed partly in a Linux container (no Windows machine on hand during initial development), so Windows-only code has both a real implementation and a Linux stand-in used purely to keep the build and test suite running during development — see `AGENTS.md` for how that split works and how to verify Windows-only code without a Windows machine.
 
 **Status:** Phases 1–6 (agent core, intermittent-issue detection, tray, session-viewer UI, packaging & polish, gaming overlay) and Phase 8 (temperatures and throttling, without the CPU's own temperature) are implemented and at least smoke-tested. Full roadmap, what's verified vs. not, and per-phase implementation notes live in [`TODO.md`](TODO.md) — read it before picking up work here.
